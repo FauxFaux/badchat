@@ -1,0 +1,9 @@
+[package]
+name = "badchat"
+version = "0.1.0"
+authors = ["Chris West (Faux) <git@goeswhere.com>"]
+edition = "2018"
+
+[dependencies]
+failure = "0.1.2"
+crossbeam-channel = "0.2.6"
