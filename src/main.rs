@@ -52,13 +52,6 @@ const LISTENER: mio::Token = mio::Token(0);
 enum ServerMode {
     /// Write back received bytes
     Echo,
-
-    /// Do one read, then write a bodged HTTP response and
-    /// cleanly close the connection.
-    Http,
-
-    /// Forward traffic to/from given port on localhost.
-    Forward(u16),
 }
 
 /// This binds together a TCP listening socket, some outstanding
@@ -130,35 +123,6 @@ struct Connection {
     closed: bool,
     mode: ServerMode,
     tls_session: rustls::ServerSession,
-    back: Option<TcpStream>,
-    sent_http_response: bool,
-}
-
-/// Open a plaintext TCP-level connection for forwarded connections.
-fn open_back(mode: &ServerMode) -> Option<TcpStream> {
-    match *mode {
-        ServerMode::Forward(ref port) => {
-            let addr = net::SocketAddrV4::new(net::Ipv4Addr::new(127, 0, 0, 1), *port);
-            let conn = TcpStream::connect(&net::SocketAddr::V4(addr)).unwrap();
-            Some(conn)
-        }
-        _ => None,
-    }
-}
-
-/// This used to be conveniently exposed by mio: map EWOULDBLOCK
-/// errors to something less-errory.
-fn try_read(r: io::Result<usize>) -> io::Result<Option<usize>> {
-    match r {
-        Ok(len) => Ok(Some(len)),
-        Err(e) => {
-            if e.kind() == io::ErrorKind::WouldBlock {
-                Ok(None)
-            } else {
-                Err(e)
-            }
-        }
-    }
 }
 
 impl Connection {
@@ -168,7 +132,6 @@ impl Connection {
         mode: ServerMode,
         tls_session: rustls::ServerSession,
     ) -> Connection {
-        let back = open_back(&mode);
         Connection {
             socket,
             token,
@@ -176,8 +139,6 @@ impl Connection {
             closed: false,
             mode,
             tls_session,
-            back,
-            sent_http_response: false,
         }
     }
 
@@ -189,7 +150,6 @@ impl Connection {
         if ev.readiness().is_readable() {
             self.do_tls_read();
             self.try_plain_read();
-            self.try_back_read();
         }
 
         if ev.readiness().is_writable() {
@@ -198,20 +158,10 @@ impl Connection {
 
         if self.closing && !self.tls_session.wants_write() {
             let _ = self.socket.shutdown(Shutdown::Both);
-            self.close_back();
             self.closed = true;
         } else {
             self.reregister(poll);
         }
-    }
-
-    /// Close the backend connection for forwarded sessions.
-    fn close_back(&mut self) {
-        if self.back.is_some() {
-            let back = self.back.as_mut().unwrap();
-            back.shutdown(Shutdown::Both).unwrap();
-        }
-        self.back = None;
     }
 
     fn do_tls_read(&mut self) {
@@ -261,60 +211,12 @@ impl Connection {
         }
     }
 
-    fn try_back_read(&mut self) {
-        if self.back.is_none() {
-            return;
-        }
-
-        // Try a non-blocking read.
-        let mut buf = [0u8; 1024];
-        let back = self.back.as_mut().unwrap();
-        let rc = try_read(back.read(&mut buf));
-
-        if rc.is_err() {
-            error!("backend read failed: {:?}", rc);
-            self.closing = true;
-            return;
-        }
-
-        let maybe_len = rc.unwrap();
-
-        // If we have a successful but empty read, that's an EOF.
-        // Otherwise, we shove the data into the TLS session.
-        match maybe_len {
-            Some(len) if len == 0 => {
-                debug!("back eof");
-                self.closing = true;
-            }
-            Some(len) => {
-                self.tls_session.write_all(&buf[..len]).unwrap();
-            }
-            None => {}
-        };
-    }
-
     /// Process some amount of received plaintext.
     fn incoming_plaintext(&mut self, buf: &[u8]) {
         match self.mode {
             ServerMode::Echo => {
                 self.tls_session.write_all(buf).unwrap();
             }
-            ServerMode::Http => {
-                self.send_http_response_once();
-            }
-            ServerMode::Forward(_) => {
-                self.back.as_mut().unwrap().write_all(buf).unwrap();
-            }
-        }
-    }
-
-    fn send_http_response_once(&mut self) {
-        let response =
-            b"HTTP/1.0 200 OK\r\nConnection: close\r\n\r\nHello world from rustls tlsserver\r\n";
-        if !self.sent_http_response {
-            self.tls_session.write_all(response).unwrap();
-            self.sent_http_response = true;
-            self.tls_session.send_close_notify();
         }
     }
 
@@ -337,16 +239,6 @@ impl Connection {
             mio::PollOpt::level() | mio::PollOpt::oneshot(),
         )
         .unwrap();
-
-        if self.back.is_some() {
-            poll.register(
-                self.back.as_ref().unwrap(),
-                self.token,
-                mio::Ready::readable(),
-                mio::PollOpt::level() | mio::PollOpt::oneshot(),
-            )
-            .unwrap();
-        }
     }
 
     fn reregister(&self, poll: &mut mio::Poll) {
@@ -357,16 +249,6 @@ impl Connection {
             mio::PollOpt::level() | mio::PollOpt::oneshot(),
         )
         .unwrap();
-
-        if self.back.is_some() {
-            poll.reregister(
-                self.back.as_ref().unwrap(),
-                self.token,
-                mio::Ready::readable(),
-                mio::PollOpt::level() | mio::PollOpt::oneshot(),
-            )
-            .unwrap();
-        }
     }
 
     /// What IO events we're currently waiting for,
