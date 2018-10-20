@@ -75,7 +75,7 @@ impl TlsServer {
         let token = mio::Token(self.next_id);
         self.next_id += 1;
         let conn = Connection::new(socket, token, tls_session);
-        conn.register(poll)?;
+        conn.register_on_connect(poll)?;
         self.connections.insert(token, conn);
 
         Ok(())
@@ -95,11 +95,6 @@ impl TlsServer {
     }
 }
 
-/// This is a connection which has been accepted by the server,
-/// and is currently being served.
-///
-/// It has a TCP-level stream, a TLS-level session, and some
-/// other state/metadata.
 struct Connection {
     socket: TcpStream,
     token: mio::Token,
@@ -202,7 +197,7 @@ impl Connection {
         }
     }
 
-    fn register(&self, poll: &mut mio::Poll) -> Result<(), Error> {
+    fn register_on_connect(&self, poll: &mut mio::Poll) -> Result<(), Error> {
         Ok(poll.register(
             &self.socket,
             self.token,
