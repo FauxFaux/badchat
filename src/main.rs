@@ -15,5 +15,5 @@ use failure::ResultExt;
 fn main() -> Result<(), Error> {
     env_logger::Builder::new().parse("trace").init();
 
-    serv::serve_forever()
+    Ok(serv::serve_forever().with_context(|_| format_err!("running server"))?)
 }
