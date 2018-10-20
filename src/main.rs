@@ -47,13 +47,6 @@ use self::util::WriteVAdapter;
 // Token for our listening socket.
 const LISTENER: mio::Token = mio::Token(0);
 
-// Which mode the server operates in.
-#[derive(Clone)]
-enum ServerMode {
-    /// Write back received bytes
-    Echo,
-}
-
 /// This binds together a TCP listening socket, some outstanding
 /// connections, and a TLS server configuration.
 struct TlsServer {
@@ -61,41 +54,32 @@ struct TlsServer {
     connections: HashMap<mio::Token, Connection>,
     next_id: usize,
     tls_config: Arc<rustls::ServerConfig>,
-    mode: ServerMode,
 }
 
 impl TlsServer {
-    fn new(server: TcpListener, mode: ServerMode, cfg: Arc<rustls::ServerConfig>) -> TlsServer {
+    fn new(server: TcpListener, cfg: Arc<rustls::ServerConfig>) -> TlsServer {
         TlsServer {
             server,
             connections: HashMap::new(),
             next_id: 2,
             tls_config: cfg,
-            mode,
         }
     }
 
-    fn accept(&mut self, poll: &mut mio::Poll) -> bool {
-        match self.server.accept() {
-            Ok((socket, addr)) => {
-                debug!("Accepting new connection from {:?}", addr);
+    fn accept(&mut self, poll: &mut mio::Poll) -> Result<(), Error> {
+        let (socket, addr) = self.server.accept()?;
+        debug!("Accepting new connection from {:?}", addr);
 
-                let tls_session = rustls::ServerSession::new(&self.tls_config);
-                let mode = self.mode.clone();
+        let tls_session = rustls::ServerSession::new(&self.tls_config);
 
-                let token = mio::Token(self.next_id);
-                self.next_id += 1;
+        let token = mio::Token(self.next_id);
+        self.next_id += 1;
 
-                self.connections
-                    .insert(token, Connection::new(socket, token, mode, tls_session));
-                self.connections[&token].register(poll);
-                true
-            }
-            Err(e) => {
-                println!("encountered error while accepting connection; err={:?}", e);
-                false
-            }
-        }
+        self.connections
+            .insert(token, Connection::new(socket, token, tls_session));
+        self.connections[&token].register(poll);
+
+        Ok(())
     }
 
     fn conn_event(&mut self, poll: &mut mio::Poll, event: &mio::Event) {
@@ -121,23 +105,16 @@ struct Connection {
     token: mio::Token,
     closing: bool,
     closed: bool,
-    mode: ServerMode,
     tls_session: rustls::ServerSession,
 }
 
 impl Connection {
-    fn new(
-        socket: TcpStream,
-        token: mio::Token,
-        mode: ServerMode,
-        tls_session: rustls::ServerSession,
-    ) -> Connection {
+    fn new(socket: TcpStream, token: mio::Token, tls_session: rustls::ServerSession) -> Connection {
         Connection {
             socket,
             token,
             closing: false,
             closed: false,
-            mode,
             tls_session,
         }
     }
@@ -213,11 +190,7 @@ impl Connection {
 
     /// Process some amount of received plaintext.
     fn incoming_plaintext(&mut self, buf: &[u8]) {
-        match self.mode {
-            ServerMode::Echo => {
-                self.tls_session.write_all(buf).unwrap();
-            }
-        }
+        self.tls_session.write_all(buf).unwrap();
     }
 
     fn do_tls_write(&mut self) {
@@ -271,33 +244,38 @@ impl Connection {
     }
 }
 
-fn load_certs(filename: &str) -> Vec<rustls::Certificate> {
-    let certfile = fs::File::open(filename).expect("cannot open certificate file");
+fn load_certs(filename: &str) -> Result<Vec<rustls::Certificate>, Error> {
+    let certfile =
+        fs::File::open(filename).with_context(|_| format_err!("cannot open certificate file"))?;
     let mut reader = BufReader::new(certfile);
-    rustls::internal::pemfile::certs(&mut reader).unwrap()
+    Ok(rustls::internal::pemfile::certs(&mut reader)
+        .map_err(|()| format_err!("pemfile certs reader"))?)
 }
 
-fn load_private_key(filename: &str) -> rustls::PrivateKey {
+fn load_private_key(filename: &str) -> Result<rustls::PrivateKey, Error> {
     let rsa_keys = {
-        let keyfile = fs::File::open(filename).expect("cannot open private key file");
+        let keyfile = fs::File::open(filename)
+            .with_context(|_| format_err!("cannot open private key file"))?;
         let mut reader = BufReader::new(keyfile);
         rustls::internal::pemfile::rsa_private_keys(&mut reader)
-            .expect("file contains invalid rsa private key")
+            .map_err(|()| format_err!("file contains invalid rsa private key"))?
     };
 
     let pkcs8_keys = {
-        let keyfile = fs::File::open(filename).expect("cannot open private key file");
+        let keyfile = fs::File::open(filename)
+            .with_context(|_| format_err!("cannot open private key file"))?;
         let mut reader = BufReader::new(keyfile);
-        rustls::internal::pemfile::pkcs8_private_keys(&mut reader)
-            .expect("file contains invalid pkcs8 private key (encrypted keys not supported)")
+        rustls::internal::pemfile::pkcs8_private_keys(&mut reader).map_err(|_| {
+            format_err!("file contains invalid pkcs8 private key (encrypted keys not supported)")
+        })?
     };
 
     // prefer to load pkcs8 keys
     if !pkcs8_keys.is_empty() {
-        pkcs8_keys[0].clone()
+        Ok(pkcs8_keys[0].clone())
     } else {
         assert!(!rsa_keys.is_empty());
-        rsa_keys[0].clone()
+        Ok(rsa_keys[0].clone())
     }
 }
 
@@ -305,8 +283,8 @@ fn make_config() -> Result<rustls::ServerConfig, Error> {
     let mut config = rustls::ServerConfig::new(NoClientAuth::new());
     config.key_log = Arc::new(rustls::KeyLogFile::new());
 
-    let certs = load_certs("localhost.crt");
-    let privkey = load_private_key("localhost.key");
+    let certs = load_certs("localhost.crt")?;
+    let privkey = load_private_key("localhost.key")?;
     config
         .set_single_cert_with_ocsp_and_sct(certs, privkey, vec![], vec![])
         .with_context(|_| format_err!("bad certificates/private key"))?;
@@ -317,35 +295,29 @@ fn make_config() -> Result<rustls::ServerConfig, Error> {
 fn main() -> Result<(), Error> {
     env_logger::Builder::new().parse("trace").init();
 
-    let addr: net::SocketAddr = "127.0.0.1:6697".parse().unwrap();
+    let addr: net::SocketAddr = "127.0.0.1:6697".parse()?;
 
     let config = Arc::new(make_config()?);
 
-    let listener = TcpListener::bind(&addr).expect("cannot listen on port");
-    let mut poll = mio::Poll::new().unwrap();
+    let listener =
+        TcpListener::bind(&addr).with_context(|_| format_err!("cannot listen on port"))?;
+    let mut poll = mio::Poll::new()?;
     poll.register(
         &listener,
         LISTENER,
         mio::Ready::readable(),
         mio::PollOpt::level(),
-    )
-    .unwrap();
+    )?;
 
-    let mode = ServerMode::Echo;
-
-    let mut tlsserv = TlsServer::new(listener, mode, config);
+    let mut tlsserv = TlsServer::new(listener, config);
 
     let mut events = mio::Events::with_capacity(256);
     loop {
-        poll.poll(&mut events, None).unwrap();
+        poll.poll(&mut events, None)?;
 
         for event in events.iter() {
             match event.token() {
-                LISTENER => {
-                    if !tlsserv.accept(&mut poll) {
-                        break;
-                    }
-                }
+                LISTENER => tlsserv.accept(&mut poll)?,
                 _ => tlsserv.conn_event(&mut poll, &event),
             }
         }
