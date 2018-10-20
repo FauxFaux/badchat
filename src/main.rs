@@ -74,23 +74,24 @@ impl TlsServer {
 
         let token = mio::Token(self.next_id);
         self.next_id += 1;
-
-        self.connections
-            .insert(token, Connection::new(socket, token, tls_session));
-        self.connections[&token].register(poll);
+        let conn = Connection::new(socket, token, tls_session);
+        conn.register(poll)?;
+        self.connections.insert(token, conn);
 
         Ok(())
     }
 
-    fn conn_event(&mut self, poll: &mut mio::Poll, event: &mio::Event) {
+    fn conn_event(&mut self, poll: &mut mio::Poll, event: &mio::Event) -> Result<(), Error> {
         let token = event.token();
 
         if let Some(conn) = self.connections.get_mut(&token) {
-            conn.ready(poll, event);
+            conn.ready(poll, event)?;
             if conn.is_closed() {
                 self.connections.remove(&token);
             }
         }
+
+        Ok(())
     }
 }
 
@@ -119,13 +120,13 @@ impl Connection {
     }
 
     /// We're a connection, and we have something to do.
-    fn ready(&mut self, poll: &mut mio::Poll, ev: &mio::Event) {
+    fn ready(&mut self, poll: &mut mio::Poll, ev: &mio::Event) -> Result<(), Error> {
         // If we're readable: read some TLS.  Then
         // see if that yielded new plaintext.  Then
         // see if the backend is readable too.
         if ev.readiness().is_readable() {
             self.do_tls_read();
-            self.try_plain_read();
+            self.try_plain_read()?;
         }
 
         if ev.readiness().is_writable() {
@@ -136,8 +137,10 @@ impl Connection {
             let _ = self.socket.shutdown(Shutdown::Both);
             self.closed = true;
         } else {
-            self.reregister(poll);
+            self.reregister(poll)?;
         }
+
+        Ok(())
     }
 
     fn do_tls_read(&mut self) {
@@ -146,52 +149,46 @@ impl Connection {
             Ok(0) => {
                 debug!("eof");
                 self.closing = true;
-                return;
             }
 
-            Err(ref e) if io::ErrorKind::WouldBlock == e.kind() => {
-                return;
-            }
+            Err(ref e) if io::ErrorKind::WouldBlock == e.kind() => (),
 
             Err(e) => {
                 error!("read error {:?}", e);
                 self.closing = true;
-                return;
             }
 
-            Ok(_) => (),
-        }
-
-        // Process newly-received TLS messages.
-        match self.tls_session.process_new_packets() {
-            Ok(()) => (),
-            Err(e) => {
-                error!("cannot process packet: {:?}", e);
-                self.closing = true;
+            Ok(_) => {
+                if let Err(e) = self.tls_session.process_new_packets() {
+                    error!("cannot process packet: {:?}", e);
+                    self.closing = true;
+                }
             }
         }
     }
 
-    fn try_plain_read(&mut self) {
+    fn try_plain_read(&mut self) -> Result<(), Error> {
         // Read and process all available plaintext.
         let mut buf = Vec::new();
 
-        let rc = self.tls_session.read_to_end(&mut buf);
-        if rc.is_err() {
-            error!("plaintext read failed: {:?}", rc);
-            self.closing = true;
-            return;
+        match self.tls_session.read_to_end(&mut buf) {
+            Ok(0) => (),
+            Ok(_) => {
+                debug!("plaintext read {:?}", buf.len());
+                self.incoming_plaintext(&buf)?;
+            }
+            Err(e) => {
+                error!("plaintext read failed: {:?}", e);
+                self.closing = true;
+            }
         }
 
-        if !buf.is_empty() {
-            debug!("plaintext read {:?}", buf.len());
-            self.incoming_plaintext(&buf);
-        }
+        Ok(())
     }
 
     /// Process some amount of received plaintext.
-    fn incoming_plaintext(&mut self, buf: &[u8]) {
-        self.tls_session.write_all(buf).unwrap();
+    fn incoming_plaintext(&mut self, buf: &[u8]) -> Result<(), Error> {
+        Ok(self.tls_session.write_all(buf)?)
     }
 
     fn do_tls_write(&mut self) {
@@ -205,24 +202,22 @@ impl Connection {
         }
     }
 
-    fn register(&self, poll: &mut mio::Poll) {
-        poll.register(
+    fn register(&self, poll: &mut mio::Poll) -> Result<(), Error> {
+        Ok(poll.register(
             &self.socket,
             self.token,
             self.event_set(),
             mio::PollOpt::level() | mio::PollOpt::oneshot(),
-        )
-        .unwrap();
+        )?)
     }
 
-    fn reregister(&self, poll: &mut mio::Poll) {
-        poll.reregister(
+    fn reregister(&self, poll: &mut mio::Poll) -> Result<(), Error> {
+        Ok(poll.reregister(
             &self.socket,
             self.token,
             self.event_set(),
             mio::PollOpt::level() | mio::PollOpt::oneshot(),
-        )
-        .unwrap();
+        )?)
     }
 
     /// What IO events we're currently waiting for,
@@ -319,7 +314,7 @@ fn main() -> Result<(), Error> {
         for event in events.iter() {
             match event.token() {
                 LISTENER => tlsserv.accept(&mut poll)?,
-                _ => tlsserv.conn_event(&mut poll, &event),
+                _ => tlsserv.conn_event(&mut poll, &event)?,
             }
         }
     }
