@@ -85,10 +85,9 @@ impl TlsServer {
     fn conn_event(&mut self, poll: &mut mio::Poll, event: &mio::Event) {
         let token = event.token();
 
-        if self.connections.contains_key(&token) {
-            self.connections.get_mut(&token).unwrap().ready(poll, event);
-
-            if self.connections[&token].is_closed() {
+        if let Some(conn) = self.connections.get_mut(&token) {
+            conn.ready(poll, event);
+            if conn.is_closed() {
                 self.connections.remove(&token);
             }
         }
@@ -143,31 +142,33 @@ impl Connection {
 
     fn do_tls_read(&mut self) {
         // Read some TLS data.
-        let rc = self.tls_session.read_tls(&mut self.socket);
-        if rc.is_err() {
-            let err = rc.unwrap_err();
-
-            if let io::ErrorKind::WouldBlock = err.kind() {
+        match self.tls_session.read_tls(&mut self.socket) {
+            Ok(0) => {
+                debug!("eof");
+                self.closing = true;
                 return;
             }
 
-            error!("read error {:?}", err);
-            self.closing = true;
-            return;
-        }
+            Err(ref e) if io::ErrorKind::WouldBlock == e.kind() => {
+                return;
+            }
 
-        if rc.unwrap() == 0 {
-            debug!("eof");
-            self.closing = true;
-            return;
+            Err(e) => {
+                error!("read error {:?}", e);
+                self.closing = true;
+                return;
+            }
+
+            Ok(_) => (),
         }
 
         // Process newly-received TLS messages.
-        let processed = self.tls_session.process_new_packets();
-        if processed.is_err() {
-            error!("cannot process packet: {:?}", processed);
-            self.closing = true;
-            return;
+        match self.tls_session.process_new_packets() {
+            Ok(()) => (),
+            Err(e) => {
+                error!("cannot process packet: {:?}", e);
+                self.closing = true;
+            }
         }
     }
 
