@@ -5,11 +5,14 @@ extern crate irc;
 #[macro_use]
 extern crate log;
 extern crate mio;
+extern crate pbkdf2;
 extern crate rand;
+extern crate rusqlite;
 extern crate rustls;
 extern crate vecio;
 
 mod serv;
+mod store;
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -33,8 +36,8 @@ impl Default for PingToken {
     }
 }
 
-#[derive(Default)]
 struct System {
+    store: store::Store,
     registering: HashMap<ConnId, PreAuth>,
     clients: HashMap<ConnId, Client>,
 }
@@ -94,8 +97,12 @@ impl ErrorCode {
 }
 
 impl System {
-    fn new() -> System {
-        System::default()
+    fn new() -> Result<System, Error> {
+        Ok(System {
+            store: store::Store::new()?,
+            clients: HashMap::new(),
+            registering: HashMap::new(),
+        })
     }
 
     fn work(&mut self, connections: &mut serv::Connections) {
@@ -105,6 +112,8 @@ impl System {
                 connection.start_closing();
             }
         }
+
+
     }
 
     fn process_commands(&mut self, conn: &mut serv::Connection) -> Result<(), Error> {
@@ -198,6 +207,8 @@ impl System {
             return Ok(());
         }
 
+        self.store.user(state.nick.as_ref().unwrap(), state.pass.as_ref().unwrap())?;
+
         Ok(())
     }
 }
@@ -228,7 +239,7 @@ fn pop_line(buf: &mut VecDeque<u8>) -> Option<Vec<u8>> {
 fn main() -> Result<(), Error> {
     env_logger::Builder::new().parse("trace").init();
 
-    let mut system = System::new();
+    let mut system = System::new()?;
 
     Ok(serv::serve_forever(|connections| system.work(connections))
         .with_context(|_| format_err!("running server"))?)
