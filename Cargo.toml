@@ -6,8 +6,13 @@ edition = "2018"
 
 [dependencies]
 env_logger = "0.5.13"
-failure = "0.1.2"
+failure = "0.1.3"
 log = "0.4.5"
 mio = "0.6.16"
 rustls = "0.14.0"
 vecio = "0.1.0"
+
+[dependencies.irc]
+# HEAD + USER parse fix: https://github.com/aatxe/irc/pull/161
+git = "https://github.com/FauxFaux/irc"
+rev = "99fe1256e1fdf67073fd9ca5becb8908d6ba7861"

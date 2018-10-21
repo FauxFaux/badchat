@@ -1,7 +1,10 @@
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::fs;
 use std::io;
-use std::io::{BufReader, Read, Write};
+use std::io::BufReader;
+use std::io::Read;
+use std::io::Write;
 use std::net;
 use std::sync::Arc;
 
@@ -32,11 +35,13 @@ impl<'a> rustls::WriteV for WriteVAdapter<'a> {
 // Token for our listening socket.
 const LISTENER: mio::Token = mio::Token(0);
 
+pub type Connections = HashMap<mio::Token, Connection>;
+
 /// This binds together a TCP listening socket, some outstanding
 /// connections, and a TLS server configuration.
 struct TlsServer {
     server: TcpListener,
-    connections: HashMap<mio::Token, Connection>,
+    connections: Connections,
     next_id: usize,
     tls_config: Arc<rustls::ServerConfig>,
 }
@@ -80,12 +85,13 @@ impl TlsServer {
     }
 }
 
-struct Connection {
+pub struct Connection {
     socket: TcpStream,
-    token: mio::Token,
+    pub token: mio::Token,
     closing: bool,
     closed: bool,
     tls_session: rustls::ServerSession,
+    pub input_buffer: VecDeque<u8>,
 }
 
 impl Connection {
@@ -96,6 +102,7 @@ impl Connection {
             closing: false,
             closed: false,
             tls_session,
+            input_buffer: VecDeque::new(),
         }
     }
 
@@ -155,7 +162,7 @@ impl Connection {
             Ok(0) => (),
             Ok(_) => {
                 debug!("plaintext read {:?}", buf.len());
-                self.incoming_plaintext(&buf)?;
+                self.input_buffer.extend(buf);
             }
             Err(e) => {
                 error!("plaintext read failed: {:?}", e);
@@ -164,11 +171,6 @@ impl Connection {
         }
 
         Ok(())
-    }
-
-    /// Process some amount of received plaintext.
-    fn incoming_plaintext(&mut self, buf: &[u8]) -> Result<(), Error> {
-        Ok(self.tls_session.write_all(buf)?)
     }
 
     fn do_tls_write(&mut self) {
@@ -217,6 +219,16 @@ impl Connection {
 
     fn is_closed(&self) -> bool {
         self.closed
+    }
+
+    pub fn start_closing(&mut self) {
+        self.closing = true;
+    }
+
+    pub fn write_line(&mut self, val: &str) -> Result<(), Error> {
+        self.tls_session.write_all(val.as_bytes())?;
+        self.tls_session.write_all(b"\r\n")?;
+        Ok(())
     }
 }
 
@@ -268,7 +280,7 @@ fn make_config() -> Result<rustls::ServerConfig, Error> {
     Ok(config)
 }
 
-pub fn serve_forever() -> Result<(), Error> {
+pub fn serve_forever<F: FnMut(&mut Connections)>(mut work: F) -> Result<(), Error> {
     let addr: net::SocketAddr = "127.0.0.1:6697".parse()?;
 
     let config = Arc::new(make_config()?);
@@ -295,5 +307,7 @@ pub fn serve_forever() -> Result<(), Error> {
                 _ => tlsserv.conn_event(&mut poll, &event)?,
             }
         }
+
+        work(&mut tlsserv.connections);
     }
 }
