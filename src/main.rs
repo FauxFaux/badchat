@@ -242,10 +242,9 @@ impl System {
             return Ok(());
         }
 
-        match self
-            .store
-            .user(state.nick.as_ref().unwrap(), state.pass.as_ref().unwrap())?
-        {
+        let nick = state.nick.as_ref().unwrap();
+
+        let id = match self.store.user(nick, state.pass.as_ref().unwrap())? {
             Some(id) => id,
             None => {
                 conn.write_line(&format!(
@@ -259,6 +258,38 @@ impl System {
                 return Ok(());
             }
         };
+
+        // This is all legacy garbage. Trying to get any possible client to continue the connection.
+
+        // Minimal hello.
+
+        conn.write_line(format!(":ircd 001 {} :Hi!", nick))?;
+        conn.write_line(format!(":ircd 002 {} :This is IRC.", nick))?;
+        conn.write_line(format!(":ircd 003 {} :This server is.", nick))?;
+        conn.write_line(format!(":ircd 004 {} ircd badchat iZ s", nick))?;
+        conn.write_line(format!(
+            ":ircd 005 {} SAFELIST :are supported by this server",
+            nick
+        ))?;
+
+        // Minimal LUSERS
+
+        conn.write_line(format!(":ircd 251 {} :There are users.", nick))?;
+        conn.write_line(format!(":ircd 254 {} 69 :channels formed", nick))?;
+        conn.write_line(format!(":ircd 255 {} :I have clients and servers.", nick))?;
+        conn.write_line(format!(
+            ":ircd 265 {} 69 69 :Current local users are nice.",
+            nick
+        ))?;
+
+        // Minimal MOTD
+
+        conn.write_line(format!(
+            ":ircd 422 {} :MOTDs haven't been cool for decades.",
+            nick
+        ))?;
+
+        conn.write_line(format!(":{} MODE {0} :+iZ", nick))?;
 
         Ok(())
     }

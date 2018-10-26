@@ -215,7 +215,8 @@ impl Connection {
         self.closing = true;
     }
 
-    pub fn write_line(&mut self, val: &str) -> Result<(), Error> {
+    pub fn write_line<S: AsRef<str>>(&mut self, val: S) -> Result<(), Error> {
+        let val = val.as_ref();
         trace!("output: {:?}: {:?})", self.token, val);
         self.tls_session.write_all(val.as_bytes())?;
         self.tls_session.write_all(b"\r\n")?;
