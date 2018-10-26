@@ -43,19 +43,32 @@ struct System {
     clients: HashMap<ConnId, Client>,
 }
 
+#[derive(Copy, Clone, Eq, PartialEq)]
+enum PreAuthPing {
+    WaitingForNick,
+    WaitingForPong,
+    Complete,
+}
+
 #[derive(Default)]
 struct PreAuth {
     nick: Option<String>,
     pass: Option<String>,
     gecos: Option<(String, String)>,
     wants_cap: bool,
-    ping: bool,
+    ping: PreAuthPing,
     ping_token: PingToken,
 }
 
 impl PreAuth {
     fn is_client_preamble_done(&self) -> bool {
-        self.gecos.is_some() && self.nick.is_some()
+        self.gecos.is_some() && self.nick.is_some() && PreAuthPing::Complete == self.ping
+    }
+}
+
+impl Default for PreAuthPing {
+    fn default() -> Self {
+        PreAuthPing::WaitingForNick
     }
 }
 
@@ -187,8 +200,20 @@ impl System {
                 conn.write_line(":ircd CAP * LS :")?;
             }
             Command::PASS(pass) => state.pass = Some(pass),
-            Command::NICK(nick) => state.nick = Some(nick),
+            Command::NICK(nick) => {
+                state.nick = Some(nick);
+                if state.ping == PreAuthPing::WaitingForNick {
+                    state.ping = PreAuthPing::WaitingForPong;
+                    conn.write_line(&format!("PING :{:08x}", state.ping_token.0))?;
+                }
+            }
             Command::USER(ident, _mode, real_name) => state.gecos = Some((ident, real_name)),
+            Command::PONG(ref token, _)
+                if PreAuthPing::WaitingForPong == state.ping
+                    && u64::from_str_radix(token, 16) == Ok(state.ping_token.0) =>
+            {
+                state.ping = PreAuthPing::Complete
+            }
             Command::Raw(ref raw, ..) if is_http_verb(raw) => {
                 info!("http command on channel: {:?}", raw);
                 // TODO: is it worth sending them anything?
