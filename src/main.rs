@@ -207,7 +207,13 @@ impl System {
             return Ok(());
         }
 
-        self.store.user(state.nick.as_ref().unwrap(), state.pass.as_ref().unwrap())?;
+        // TODO: well, the whole thing
+        // TODO: we don't manage to close a connection if we tell a client something, and they
+        // TODO: don't reply. We need to re-flag based on pending work after processing.
+        // TODO: very tempting to just do this for all connections, or possibly all connections
+        // TODO: in the event set? Does the event set mutate itself between iterations? There's
+        // TODO: some mention of it in the "Index is deprecated" part.
+        let _ = self.store.user(state.nick.as_ref().unwrap(), state.pass.as_ref().unwrap());
 
         Ok(())
     }
