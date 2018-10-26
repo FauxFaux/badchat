@@ -73,6 +73,9 @@ enum ErrorCode {
     // RFC1459, but we also send it for some parse errors
     UnknownCommand,
 
+    // RFC1459, sent for internal errors processing commands
+    FileError,
+
     // RFC1459, including invalid pre-auth command parsing
     NotRegistered,
 
@@ -89,6 +92,7 @@ impl ErrorCode {
             ErrorCode::UnknownError => 400,
             ErrorCode::LineTooLong => 419,
             ErrorCode::UnknownCommand => 421,
+            ErrorCode::FileError => 424,
             ErrorCode::NotRegistered => 451,
             ErrorCode::PasswordMismatch => 451,
             ErrorCode::BadCharEncoding => 980,
@@ -106,14 +110,18 @@ impl System {
     }
 
     fn work(&mut self, connections: &mut serv::Connections) {
-        for (_token, connection) in connections {
-            if let Err(e) = self.process_commands(connection) {
+        for (_token, conn) in connections {
+            if let Err(e) = self.process_commands(conn) {
                 error!("failed processing commands: {:?}", e);
-                connection.start_closing();
+                if let Err(e) = conn.write_line(&format!(
+                    ":ircd {} * :server error",
+                    ErrorCode::FileError.into_numeric()
+                )) {
+                    error!("..and couldn't tell them, so bye: {:?}", e);
+                    conn.start_closing();
+                }
             }
         }
-
-
     }
 
     fn process_commands(&mut self, conn: &mut serv::Connection) -> Result<(), Error> {
@@ -213,7 +221,8 @@ impl System {
         // TODO: very tempting to just do this for all connections, or possibly all connections
         // TODO: in the event set? Does the event set mutate itself between iterations? There's
         // TODO: some mention of it in the "Index is deprecated" part.
-        let _ = self.store.user(state.nick.as_ref().unwrap(), state.pass.as_ref().unwrap());
+        self.store
+            .user(state.nick.as_ref().unwrap(), state.pass.as_ref().unwrap())?;
 
         Ok(())
     }

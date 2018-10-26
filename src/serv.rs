@@ -70,19 +70,6 @@ impl TlsServer {
 
         Ok(())
     }
-
-    fn conn_event(&mut self, poll: &mut mio::Poll, event: &mio::Event) -> Result<(), Error> {
-        let token = event.token();
-
-        if let Some(conn) = self.connections.get_mut(&token) {
-            conn.ready(poll, event)?;
-            if conn.is_closed() {
-                self.connections.remove(&token);
-            }
-        }
-
-        Ok(())
-    }
 }
 
 pub struct Connection {
@@ -107,19 +94,21 @@ impl Connection {
     }
 
     /// We're a connection, and we have something to do.
-    fn ready(&mut self, poll: &mut mio::Poll, ev: &mio::Event) -> Result<(), Error> {
-        // If we're readable: read some TLS.  Then
-        // see if that yielded new plaintext.  Then
-        // see if the backend is readable too.
-        if ev.readiness().is_readable() {
+    fn handle_readiness(&mut self, readiness: mio::Ready) -> Result<(), Error> {
+        // If we're readable: read some TLS. Then see if that yielded new plaintext.
+        if readiness.is_readable() {
             self.do_tls_read();
             self.try_plain_read()?;
         }
 
-        if ev.readiness().is_writable() {
+        if readiness.is_writable() {
             self.do_tls_write();
         }
 
+        Ok(())
+    }
+
+    fn handle_registration(&mut self, poll: &mut mio::Poll) -> Result<(), Error> {
         if self.closing && !self.tls_session.wants_write() {
             let _ = self.socket.shutdown(Shutdown::Both);
             self.closed = true;
@@ -222,6 +211,7 @@ impl Connection {
     }
 
     pub fn start_closing(&mut self) {
+        self.tls_session.send_close_notify();
         self.closing = true;
     }
 
@@ -301,13 +291,31 @@ pub fn serve_forever<F: FnMut(&mut Connections)>(mut work: F) -> Result<(), Erro
     loop {
         poll.poll(&mut events, None)?;
 
+        // handle accepting and reading/writing data from/to active connections
         for event in events.iter() {
             match event.token() {
                 LISTENER => tlsserv.accept(&mut poll)?,
-                _ => tlsserv.conn_event(&mut poll, &event)?,
+                client => {
+                    if let Some(conn) = tlsserv.connections.get_mut(&client) {
+                        conn.handle_readiness(event.readiness())?;
+                    }
+                }
             }
         }
 
+        // TODO: we don't need to do work, or re-register for all clients here,
+        // TODO: but, by doing so, we make sure we don't miss anything.
+        // TODO: is the performance relevant?
+
+        // do useful application work on all clients
         work(&mut tlsserv.connections);
+
+        // check if any of the work we did means there's more networking work to do
+        for conn in tlsserv.connections.values_mut() {
+            conn.handle_registration(&mut poll)?;
+        }
+
+        // check if anyone actually managed to die
+        tlsserv.connections.retain(|_token, conn| !conn.is_closed());
     }
 }
