@@ -90,6 +90,9 @@ enum ErrorCode {
     // RFC1459, sent for internal errors processing commands
     FileError,
 
+    // RFC1459, possibly used as intended!
+    ErroneousNickname,
+
     // RFC1459, including invalid pre-auth command parsing
     NotRegistered,
 
@@ -107,6 +110,7 @@ impl ErrorCode {
             ErrorCode::LineTooLong => 419,
             ErrorCode::UnknownCommand => 421,
             ErrorCode::FileError => 424,
+            ErrorCode::ErroneousNickname => 432,
             ErrorCode::NotRegistered => 451,
             ErrorCode::PasswordMismatch => 451,
             ErrorCode::BadCharEncoding => 980,
@@ -201,6 +205,14 @@ impl System {
             }
             Command::PASS(pass) => state.pass = Some(pass),
             Command::NICK(nick) => {
+                if !valid_nick(&nick) {
+                    conn.write_line(&format!(
+                        ":ircd {} * :invalid nickname; ascii letters, numbers, _. 2-12",
+                        ErrorCode::ErroneousNickname.into_numeric()
+                    ))?;
+                    return Ok(());
+                }
+
                 state.nick = Some(nick);
                 if state.ping == PreAuthPing::WaitingForNick {
                     state.ping = PreAuthPing::WaitingForPong;
@@ -316,6 +328,26 @@ fn pop_line(buf: &mut VecDeque<u8>) -> Option<Vec<u8>> {
     } else {
         None
     }
+}
+
+fn valid_nick(nick: &str) -> bool {
+    if nick.len() <= 1 || nick.len() >= 12 {
+        return false;
+    }
+
+    if nick.contains(|c| !valid_nick_char(c)) {
+        return false;
+    }
+
+    if !nick.chars().next().unwrap().is_ascii_alphabetic() {
+        return false;
+    }
+
+    true
+}
+
+fn valid_nick_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || "_".contains(c)
 }
 
 fn main() -> Result<(), Error> {
