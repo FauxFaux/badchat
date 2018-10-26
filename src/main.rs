@@ -73,6 +73,7 @@ impl Default for PreAuthPing {
 }
 
 struct Client {
+    account_id: i64,
     nick: String,
 }
 
@@ -171,10 +172,13 @@ impl System {
                 }
             };
 
-            if let Some(client) = self.clients.get_mut(&conn.token) {
-                unimplemented!("client");
+            if let Some(client) = self.clients.get(&conn.token) {
+                self.handle_client_message(conn, client, message)?;
             } else {
-                self.handle_pre_auth(conn, message)?;
+                if let Some(done) = self.handle_pre_auth(conn, message)? {
+                    self.registering.remove(&conn.token);
+                    self.clients.insert(conn.token, done);
+                }
             }
         }
 
@@ -193,7 +197,7 @@ impl System {
         &mut self,
         conn: &mut serv::Connection,
         message: Message,
-    ) -> Result<(), Error> {
+    ) -> Result<Option<Client>, Error> {
         let mut state = self.registering.entry(conn.token).or_default();
 
         match message.command {
@@ -210,7 +214,7 @@ impl System {
                         ":ircd {} * :invalid nickname; ascii letters, numbers, _. 2-12",
                         ErrorCode::ErroneousNickname.into_numeric()
                     ))?;
-                    return Ok(());
+                    return Ok(None);
                 }
 
                 state.nick = Some(nick);
@@ -220,6 +224,7 @@ impl System {
                 }
             }
             Command::USER(ident, _mode, real_name) => state.gecos = Some((ident, real_name)),
+            Command::PING(ref token, _) => send_pong(conn, token)?,
             Command::PONG(ref token, _)
                 if PreAuthPing::WaitingForPong == state.ping
                     && u64::from_str_radix(token, 16) == Ok(state.ping_token.0) =>
@@ -242,7 +247,7 @@ impl System {
 
         if !state.is_client_preamble_done() {
             info!("waiting for more from client...");
-            return Ok(());
+            return Ok(None);
         }
 
         if state.pass.is_none() {
@@ -251,12 +256,12 @@ impl System {
                 ErrorCode::PasswordMismatch.into_numeric()
             ))?;
             conn.start_closing();
-            return Ok(());
+            return Ok(None);
         }
 
         let nick = state.nick.as_ref().unwrap();
 
-        let id = match self.store.user(nick, state.pass.as_ref().unwrap())? {
+        let account_id = match self.store.user(nick, state.pass.as_ref().unwrap())? {
             Some(id) => id,
             None => {
                 conn.write_line(&format!(
@@ -267,7 +272,7 @@ impl System {
                     ErrorCode::PasswordMismatch.into_numeric()
                 ))?;
                 conn.start_closing();
-                return Ok(());
+                return Ok(None);
             }
         };
 
@@ -303,8 +308,39 @@ impl System {
 
         conn.write_line(format!(":{} MODE {0} :+iZ", nick))?;
 
+        Ok(Some(Client {
+            account_id,
+            nick: nick.to_string(),
+        }))
+    }
+
+    fn handle_client_message(
+        &self,
+        conn: &mut serv::Connection,
+        client: &Client,
+        message: Message,
+    ) -> Result<(), Error> {
+        match message.command {
+            Command::PING(ref token, _) => send_pong(conn, token)?,
+            Command::PONG(..) => (),
+            other => {
+                info!("invalid command: {:?}", other);
+                conn.write_line(&format!(
+                    ":ircd {} {} ? :unrecognised or mis-parsed command: {:?}",
+                    ErrorCode::UnknownCommand.into_numeric(),
+                    client.nick,
+                    other,
+                ))?;
+            }
+        }
         Ok(())
     }
+}
+
+fn send_pong(conn: &mut serv::Connection, token: &str) -> Result<(), Error> {
+    // TODO: validate the token isn't insane
+    conn.write_line(format!("PONG :{}", token))?;
+    Ok(())
 }
 
 fn is_http_verb(word: &str) -> bool {
