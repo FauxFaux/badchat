@@ -1,3 +1,4 @@
+extern crate cast;
 extern crate env_logger;
 #[macro_use]
 extern crate failure;
@@ -203,6 +204,7 @@ impl System {
         }
 
         if !state.is_client_preamble_done() {
+            info!("waiting for more from client...");
             return Ok(());
         }
 
@@ -215,14 +217,23 @@ impl System {
             return Ok(());
         }
 
-        // TODO: well, the whole thing
-        // TODO: we don't manage to close a connection if we tell a client something, and they
-        // TODO: don't reply. We need to re-flag based on pending work after processing.
-        // TODO: very tempting to just do this for all connections, or possibly all connections
-        // TODO: in the event set? Does the event set mutate itself between iterations? There's
-        // TODO: some mention of it in the "Index is deprecated" part.
-        self.store
-            .user(state.nick.as_ref().unwrap(), state.pass.as_ref().unwrap())?;
+        match self
+            .store
+            .user(state.nick.as_ref().unwrap(), state.pass.as_ref().unwrap())?
+        {
+            Some(id) => id,
+            None => {
+                conn.write_line(&format!(
+                    concat!(
+                        ":ircd {} * :Incorrect password for account. If you don't know",
+                        " the password, you must use a different nick."
+                    ),
+                    ErrorCode::PasswordMismatch.into_numeric()
+                ))?;
+                conn.start_closing();
+                return Ok(());
+            }
+        };
 
         Ok(())
     }
