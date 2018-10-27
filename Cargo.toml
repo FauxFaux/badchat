@@ -16,9 +16,10 @@ rustls = "0.14.0"
 vecio = "0.1.0"
 
 [dependencies.irc]
-# HEAD + USER parse fix: https://github.com/aatxe/irc/pull/161
+# HEAD + optional client: https://github.com/aatxe/irc/pull/163
 git = "https://github.com/FauxFaux/irc"
-rev = "99fe1256e1fdf67073fd9ca5becb8908d6ba7861"
+rev = "a625735034cd724a704bd12b1fde1063e8d1314e"
+default-features = false
 
 [dependencies.rusqlite]
 version = "0.15.0"
