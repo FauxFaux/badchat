@@ -2,7 +2,7 @@ extern crate cast;
 extern crate env_logger;
 #[macro_use]
 extern crate failure;
-extern crate irc;
+extern crate irc_proto;
 #[macro_use]
 extern crate log;
 extern crate mio;
@@ -20,9 +20,9 @@ use std::collections::VecDeque;
 
 use failure::Error;
 use failure::ResultExt;
-use irc::proto::CapSubCommand;
-use irc::proto::Command;
-use irc::proto::Message;
+use irc_proto::CapSubCommand;
+use irc_proto::Command;
+use irc_proto::Message;
 use rand::Rng;
 
 type ConnId = mio::Token;
@@ -158,7 +158,7 @@ impl System {
 
             trace!("line: {:?}: {:?}", conn.token, line);
 
-            let message: irc::proto::Message = match line.parse() {
+            let message: irc_proto::Message = match line.parse() {
                 Ok(message) => message,
                 Err(e) => {
                     debug!("bad command: {:?} {:?}", line, e);

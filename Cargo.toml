@@ -15,10 +15,10 @@ rand = "0.5.5"
 rustls = "0.14.0"
 vecio = "0.1.0"
 
-[dependencies.irc]
-# HEAD + optional client: https://github.com/aatxe/irc/pull/163
+[dependencies.irc-proto]
+# 0.14 branch + USER parse fix
 git = "https://github.com/FauxFaux/irc"
-rev = "a625735034cd724a704bd12b1fde1063e8d1314e"
+rev = "b32f88278cfbabb653e83f846e1536491d379b58"
 default-features = false
 
 [dependencies.rusqlite]
