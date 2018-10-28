@@ -16,6 +16,7 @@ mod serv;
 mod store;
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::collections::VecDeque;
 
 use failure::Error;
@@ -72,9 +73,13 @@ impl Default for PreAuthPing {
     }
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+struct ChannelId(i64);
+
 struct Client {
     account_id: i64,
     nick: String,
+    channels: HashSet<ChannelId>,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -172,8 +177,8 @@ impl System {
                 }
             };
 
-            if let Some(client) = self.clients.get(&conn.token) {
-                self.handle_client_message(conn, client, message)?;
+            if self.clients.contains_key(&conn.token) {
+                self.handle_client_message(conn, message)?;
             } else {
                 if let Some(done) = self.handle_pre_auth(conn, message)? {
                     self.registering.remove(&conn.token);
@@ -311,16 +316,37 @@ impl System {
         Ok(Some(Client {
             account_id,
             nick: nick.to_string(),
+            channels: HashSet::new(),
         }))
     }
 
     fn handle_client_message(
-        &self,
+        &mut self,
         conn: &mut serv::Connection,
-        client: &Client,
         message: Message,
     ) -> Result<(), Error> {
+        let client = self
+            .clients
+            .get_mut(&conn.token)
+            .expect("existing clients only");
         match message.command {
+            Command::JOIN(ref chan, ref keys, ref real_name)
+                if keys.is_none() && real_name.is_none() =>
+            {
+                client.channels.insert(self.store.load_channel(chan)?);
+                // client joins, 322 topic, 333 topic who/time, 353 users, 366 end of names
+                conn.write_line(&format!(":{}!~@irc JOIN {}", client.nick, chan))?;
+                conn.write_line(&format!(
+                    ":ircd 332 {} {} :This topic intentionally left blank.",
+                    client.nick, chan
+                ))?;
+                // @: secret channel (+s)
+                conn.write_line(&format!(
+                    ":ircd 353 {} @ {} :{}",
+                    client.nick, chan, client.nick
+                ))?;
+                conn.write_line(&format!(":ircd 366 {} {} :</names>", client.nick, chan))?;
+            }
             Command::PING(ref token, _) => send_pong(conn, token)?,
             Command::PONG(..) => (),
             other => {
