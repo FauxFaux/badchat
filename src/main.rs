@@ -325,27 +325,45 @@ impl System {
         conn: &mut serv::Connection,
         message: Message,
     ) -> Result<(), Error> {
-        let client = self
+        let token = conn.token;
+        let nick = self
             .clients
-            .get_mut(&conn.token)
-            .expect("existing clients only");
+            .get(&token)
+            .expect("existing clients only")
+            .nick
+            .to_string();
         match message.command {
             Command::JOIN(ref chan, ref keys, ref real_name)
                 if keys.is_none() && real_name.is_none() =>
             {
-                client.channels.insert(self.store.load_channel(chan)?);
+                let id = self.store.load_channel(chan)?;
+                if !self
+                    .clients
+                    .get_mut(&token)
+                    .expect("checked nick")
+                    .channels
+                    .insert(id)
+                {
+                    return Ok(());
+                }
                 // client joins, 322 topic, 333 topic who/time, 353 users, 366 end of names
-                conn.write_line(&format!(":{}!~@irc JOIN {}", client.nick, chan))?;
+                conn.write_line(&format!(":{}!~@irc JOIN {}", nick, chan))?;
                 conn.write_line(&format!(
                     ":ircd 332 {} {} :This topic intentionally left blank.",
-                    client.nick, chan
+                    nick, chan
                 ))?;
                 // @: secret channel (+s)
-                conn.write_line(&format!(
-                    ":ircd 353 {} @ {} :{}",
-                    client.nick, chan, client.nick
-                ))?;
-                conn.write_line(&format!(":ircd 366 {} {} :</names>", client.nick, chan))?;
+                // TODO: client modes in a channel
+                // TODO: splitting into multiple lines
+                let names = self
+                    .clients
+                    .values()
+                    .filter(|client| client.channels.contains(&id))
+                    .map(|client| client.nick.as_ref())
+                    .collect::<Vec<&str>>()
+                    .join(" ");
+                conn.write_line(&format!(":ircd 353 {} @ {} :{}", nick, chan, names))?;
+                conn.write_line(&format!(":ircd 366 {} {} :</names>", nick, chan))?;
             }
             Command::PING(ref token, _) => send_pong(conn, token)?,
             Command::PONG(..) => (),
@@ -354,7 +372,7 @@ impl System {
                 conn.write_line(&format!(
                     ":ircd {} {} ? :unrecognised or mis-parsed command: {:?}",
                     ErrorCode::UnknownCommand.into_numeric(),
-                    client.nick,
+                    nick,
                     other,
                 ))?;
             }
