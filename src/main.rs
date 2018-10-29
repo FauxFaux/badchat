@@ -134,67 +134,44 @@ impl System {
     }
 
     fn work(&mut self, connections: &mut serv::Connections) {
-        for (_token, conn) in connections {
-            if let Err(e) = self.process_commands(conn) {
-                error!("failed processing commands: {:?}", e);
-                if let Err(e) = conn.write_line(&format!(
-                    ":ircd {} * :server error",
-                    ErrorCode::FileError.into_numeric()
-                )) {
-                    error!("..and couldn't tell them, so bye: {:?}", e);
-                    conn.start_closing();
+        let all_tokens: Vec<mio::Token> = connections.keys().cloned().collect();
+        for token in all_tokens {
+            let mut conn = connections.remove(&token).expect("iterating");
+            let mut removed_client = self.clients.remove(&token);
+
+            for message in take_messages(&mut conn).expect("TODO: error handling here") {
+                let status = if let Some(ref mut client) = removed_client {
+                    self.handle_client_message(connections, &mut conn, client, message)
+                } else {
+                    match self.handle_pre_auth(&mut conn, message) {
+                        Ok(Some(done)) => {
+                            self.registering.remove(&token);
+                            removed_client = Some(done);
+                            Ok(())
+                        }
+                        other => other.map(|_| ()),
+                    }
+                };
+
+                if let Err(e) = status {
+                    error!("failed processing commands: {:?}", e);
+                    if let Err(e) = conn.write_line(&format!(
+                        ":ircd {} * :server error",
+                        ErrorCode::FileError.into_numeric()
+                    )) {
+                        error!("..and couldn't tell them, so bye: {:?}", e);
+                        conn.start_closing();
+                        break;
+                    }
                 }
             }
-        }
-    }
 
-    fn process_commands(&mut self, conn: &mut serv::Connection) -> Result<(), Error> {
-        while let Some(line) = pop_line(&mut conn.input_buffer) {
-            let line = match String::from_utf8(line) {
-                Ok(line) => line,
-                Err(_) => {
-                    conn.write_line(&format!(
-                        ":ircd {} * :utf-8 only please",
-                        ErrorCode::BadCharEncoding.into_numeric()
-                    ))?;
-                    continue;
-                }
-            };
+            connections.insert(token, conn);
 
-            trace!("line: {:?}: {:?}", conn.token, line);
-
-            let message: irc_proto::Message = match line.parse() {
-                Ok(message) => message,
-                Err(e) => {
-                    debug!("bad command: {:?} {:?}", line, e);
-                    // not a great error code here.
-                    // Maybe we should send 400 BAD REQUEST^W^W ERR_UNKNOWN_ERROR.
-                    conn.write_line(&format!(
-                        ":ircd {} * :parse error",
-                        ErrorCode::UnknownError.into_numeric(),
-                    ))?;
-                    continue;
-                }
-            };
-
-            if self.clients.contains_key(&conn.token) {
-                self.handle_client_message(conn, message)?;
-            } else {
-                if let Some(done) = self.handle_pre_auth(conn, message)? {
-                    self.registering.remove(&conn.token);
-                    self.clients.insert(conn.token, done);
-                }
+            if let Some(client) = removed_client {
+                self.clients.insert(token, client);
             }
         }
-
-        if conn.input_buffer.len() > INPUT_LENGTH_LIMIT {
-            conn.write_line(&format!(
-                ":ircd {} * :message too long",
-                ErrorCode::LineTooLong.into_numeric(),
-            ))?;
-        }
-
-        Ok(())
     }
 
     /// https://modern.ircdocs.horse/#connection-registration
@@ -322,35 +299,26 @@ impl System {
 
     fn handle_client_message(
         &mut self,
+        conns: &mut serv::Connections,
         conn: &mut serv::Connection,
+        client: &mut Client,
         message: Message,
     ) -> Result<(), Error> {
         let token = conn.token;
-        let nick = self
-            .clients
-            .get(&token)
-            .expect("existing clients only")
-            .nick
-            .to_string();
         match message.command {
             Command::JOIN(ref chan, ref keys, ref real_name)
                 if keys.is_none() && real_name.is_none() =>
             {
                 let id = self.store.load_channel(chan)?;
-                if !self
-                    .clients
-                    .get_mut(&token)
-                    .expect("checked nick")
-                    .channels
-                    .insert(id)
-                {
+                if !client.channels.insert(id) {
+                    trace!("trying to join a channel we're already in");
                     return Ok(());
                 }
                 // client joins, 322 topic, 333 topic who/time, 353 users, 366 end of names
-                conn.write_line(&format!(":{}!~@irc JOIN {}", nick, chan))?;
+                conn.write_line(&format!(":{}!~@irc JOIN {}", client.nick, chan))?;
                 conn.write_line(&format!(
                     ":ircd 332 {} {} :This topic intentionally left blank.",
-                    nick, chan
+                    client.nick, chan
                 ))?;
                 // @: secret channel (+s)
                 // TODO: client modes in a channel
@@ -362,8 +330,27 @@ impl System {
                     .map(|client| client.nick.as_ref())
                     .collect::<Vec<&str>>()
                     .join(" ");
-                conn.write_line(&format!(":ircd 353 {} @ {} :{}", nick, chan, names))?;
-                conn.write_line(&format!(":ircd 366 {} {} :</names>", nick, chan))?;
+                conn.write_line(&format!(":ircd 353 {} @ {} :{}", client.nick, chan, names))?;
+                conn.write_line(&format!(":ircd 366 {} {} :</names>", client.nick, chan))?;
+            }
+            Command::PRIVMSG(dest, msg) => {
+                if dest.starts_with("#") {
+                    let id = self.store.load_channel(&dest)?;
+                    for (other_token, other_client) in &self.clients {
+                        if !other_client.channels.contains(&id) {
+                            continue;
+                        }
+
+                        // TODO: HMMMMM, are we penalising users for other people having network
+                        // TODO: errors here? That would be lame.
+                        if let Some(other) = conns.get_mut(other_token) {
+                            other.write_line(&format!(
+                                ":{}!~@irc PRIVMSG {} :{}",
+                                client.nick, dest, msg
+                            ))?;
+                        }
+                    }
+                }
             }
             Command::PING(ref token, _) => send_pong(conn, token)?,
             Command::PONG(..) => (),
@@ -372,13 +359,56 @@ impl System {
                 conn.write_line(&format!(
                     ":ircd {} {} ? :unrecognised or mis-parsed command: {:?}",
                     ErrorCode::UnknownCommand.into_numeric(),
-                    nick,
+                    client.nick,
                     other,
                 ))?;
             }
         }
         Ok(())
     }
+}
+
+fn take_messages(conn: &mut serv::Connection) -> Result<Vec<irc_proto::Message>, Error> {
+    let mut messages = Vec::with_capacity(conn.input_buffer.len() / 32);
+    while let Some(line) = pop_line(&mut conn.input_buffer) {
+        let line = match String::from_utf8(line) {
+            Ok(line) => line,
+            Err(_) => {
+                conn.write_line(&format!(
+                    ":ircd {} * :utf-8 only please",
+                    ErrorCode::BadCharEncoding.into_numeric()
+                ))?;
+                continue;
+            }
+        };
+
+        trace!("line: {:?}: {:?}", conn.token, line);
+
+        let message: irc_proto::Message = match line.parse() {
+            Ok(message) => message,
+            Err(e) => {
+                debug!("bad command: {:?} {:?}", line, e);
+                // not a great error code here.
+                // Maybe we should send 400 BAD REQUEST^W^W ERR_UNKNOWN_ERROR.
+                conn.write_line(&format!(
+                    ":ircd {} * :parse error",
+                    ErrorCode::UnknownError.into_numeric(),
+                ))?;
+                continue;
+            }
+        };
+
+        messages.push(message);
+    }
+
+    if conn.input_buffer.len() > INPUT_LENGTH_LIMIT {
+        conn.write_line(&format!(
+            ":ircd {} * :message too long",
+            ErrorCode::LineTooLong.into_numeric(),
+        ))?;
+    }
+
+    Ok(messages)
 }
 
 fn send_pong(conn: &mut serv::Connection, token: &str) -> Result<(), Error> {
