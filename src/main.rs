@@ -124,6 +124,12 @@ impl ErrorCode {
     }
 }
 
+#[derive(Copy, Clone)]
+struct ErrorResponse {
+    code: ErrorCode,
+    message: &'static str,
+}
+
 impl System {
     fn new() -> Result<System, Error> {
         Ok(System {
@@ -370,45 +376,62 @@ impl System {
 
 fn take_messages(conn: &mut serv::Connection) -> Result<Vec<irc_proto::Message>, Error> {
     let mut messages = Vec::with_capacity(conn.input_buffer.len() / 32);
-    while let Some(line) = pop_line(&mut conn.input_buffer) {
-        let line = match String::from_utf8(line) {
-            Ok(line) => line,
-            Err(_) => {
+    loop {
+        match line_to_message(conn.token, &mut conn.input_buffer) {
+            Ok(Some(message)) => messages.push(message),
+            Ok(None) => break,
+            Err(response) => {
                 conn.write_line(&format!(
-                    ":ircd {} * :utf-8 only please",
-                    ErrorCode::BadCharEncoding.into_numeric()
+                    ":ircd {} * :{}",
+                    response.code.into_numeric(),
+                    response.message,
                 ))?;
-                continue;
             }
-        };
-
-        trace!("line: {:?}: {:?}", conn.token, line);
-
-        let message: irc_proto::Message = match line.parse() {
-            Ok(message) => message,
-            Err(e) => {
-                debug!("bad command: {:?} {:?}", line, e);
-                // not a great error code here.
-                // Maybe we should send 400 BAD REQUEST^W^W ERR_UNKNOWN_ERROR.
-                conn.write_line(&format!(
-                    ":ircd {} * :parse error",
-                    ErrorCode::UnknownError.into_numeric(),
-                ))?;
-                continue;
-            }
-        };
-
-        messages.push(message);
+        }
     }
 
-    if conn.input_buffer.len() > INPUT_LENGTH_LIMIT {
+    if conn.input_buffer.len() > 10 * INPUT_LENGTH_LIMIT {
         conn.write_line(&format!(
-            ":ircd {} * :message too long",
+            ":ircd {} * :Your input buffer is full, bye.",
             ErrorCode::LineTooLong.into_numeric(),
         ))?;
+        conn.start_closing();
+
+        // TODO: mmm, in theory, we might start processing a command at the middle of their input...
+        // TODO: we should probably stop accepting input from people who are `closing` further up
+        conn.input_buffer.clear();
     }
 
     Ok(messages)
+}
+
+fn line_to_message(token: mio::Token, input_buffer: &mut VecDeque<u8>) -> Result<Option<irc_proto::Message>, ErrorResponse> {
+    let line = match pop_line(input_buffer) {
+        PoppedLine::Done(line) => line,
+        PoppedLine::NotReady => return Ok(None),
+        PoppedLine::TooLong => return Err(ErrorResponse {
+            code: ErrorCode::LineTooLong,
+            message: "Your message was discarded as it was too long",
+        })
+    };
+
+    let line = String::from_utf8(line).map_err(|parse_error| {
+        debug!("{:?}: {:?}", token, parse_error);
+        ErrorResponse {
+            code: ErrorCode::BadCharEncoding,
+            message: "Your line was discarded as it was not encoded using 'utf-8'",
+        }
+    })?;
+
+    trace!("{:?}: line: {:?}", token, line);
+
+    Ok(Some(line.parse().map_err(|parse_error| {
+        debug!("{:?}: bad command: {:?} {:?}", token, line, parse_error);
+        ErrorResponse {
+            code: ErrorCode::UnknownError,
+            message: "Unable to parse your input as any form of message",
+        }
+    })?))
 }
 
 fn send_pong(conn: &mut serv::Connection, token: &str) -> Result<(), Error> {
@@ -427,16 +450,28 @@ fn is_http_verb(word: &str) -> bool {
     false
 }
 
-fn pop_line(buf: &mut VecDeque<u8>) -> Option<Vec<u8>> {
+enum PoppedLine {
+    Done(Vec<u8>),
+    NotReady,
+    TooLong,
+}
+
+fn pop_line(buf: &mut VecDeque<u8>) -> PoppedLine {
     if let Some(pos) = buf.iter().position(|&b| b'\n' == b) {
-        let mut vec: Vec<u8> = buf.drain(..pos).collect();
+        let drain = buf.drain(..pos);
+
+        if pos > INPUT_LENGTH_LIMIT {
+            // drain is dropped here, removing the data
+            return PoppedLine::TooLong;
+        }
+        let mut vec: Vec<u8> = drain.collect();
         assert_eq!(Some(b'\n'), buf.pop_front());
         while vec.ends_with(&[b'\r']) {
             vec.pop();
         }
-        Some(vec)
+        PoppedLine::Done(vec)
     } else {
-        None
+        PoppedLine::NotReady
     }
 }
 
