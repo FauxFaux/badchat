@@ -101,7 +101,7 @@ fn create_user(tx: Transaction, nick: &str, pass: &str) -> Result<i64, Error> {
 
     info!("created user {:?}", nick);
 
-    return Ok(account_id);
+    Ok(account_id)
 }
 
 fn create_channel(tx: Transaction, name: &str) -> Result<i64, Error> {
@@ -118,7 +118,7 @@ fn create_channel(tx: Transaction, name: &str) -> Result<i64, Error> {
 
     info!("created channel {:?}", name);
 
-    return Ok(channel_id);
+    Ok(channel_id)
 }
 
 fn check_pass(pass: &str, hashed: &str) -> Result<bool, Error> {

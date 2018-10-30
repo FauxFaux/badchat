@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::fs;
 use std::io;
@@ -10,7 +11,10 @@ use std::sync::Arc;
 
 use failure::Error;
 use failure::ResultExt;
-use mio::tcp::{Shutdown, TcpListener, TcpStream};
+use mio::tcp::Shutdown;
+use mio::tcp::TcpListener;
+use mio::tcp::TcpStream;
+use mio::Token;
 use rustls::NoClientAuth;
 use rustls::Session;
 use vecio::Rawv;
@@ -94,18 +98,21 @@ impl Connection {
     }
 
     /// We're a connection, and we have something to do.
-    fn handle_readiness(&mut self, readiness: mio::Ready) -> Result<(), Error> {
+    /// @return true if we generated some new input to process
+    fn handle_readiness(&mut self, readiness: mio::Ready) -> Result<bool, Error> {
         // If we're readable: read some TLS. Then see if that yielded new plaintext.
+        let mut new_input = false;
+
         if readiness.is_readable() {
             self.do_tls_read();
-            self.try_plain_read()?;
+            new_input |= self.try_plain_read()?;
         }
 
         if readiness.is_writable() {
             self.do_tls_write();
         }
 
-        Ok(())
+        Ok(new_input)
     }
 
     fn handle_registration(&mut self, poll: &mut mio::Poll) -> Result<(), Error> {
@@ -143,23 +150,24 @@ impl Connection {
         }
     }
 
-    fn try_plain_read(&mut self) -> Result<(), Error> {
+    /// @return true if some new data is available
+    fn try_plain_read(&mut self) -> Result<bool, Error> {
         // Read and process all available plaintext.
         let mut buf = Vec::new();
 
-        match self.tls_session.read_to_end(&mut buf) {
-            Ok(0) => (),
+        Ok(match self.tls_session.read_to_end(&mut buf) {
+            Ok(0) => false,
             Ok(_) => {
                 debug!("plaintext read {:?}", buf.len());
                 self.input_buffer.extend(buf);
+                true
             }
             Err(e) => {
                 error!("plaintext read failed: {:?}", e);
                 self.closing = true;
+                false
             }
-        }
-
-        Ok(())
+        })
     }
 
     fn do_tls_write(&mut self) {
@@ -272,7 +280,9 @@ fn make_config() -> Result<rustls::ServerConfig, Error> {
     Ok(config)
 }
 
-pub fn serve_forever<F: FnMut(&mut Connections)>(mut work: F) -> Result<(), Error> {
+pub fn serve_forever<F: FnMut(&HashSet<Token>, &mut Connections)>(
+    mut work: F,
+) -> Result<(), Error> {
     let addr: net::SocketAddr = "127.0.0.1:6697".parse()?;
 
     let config = Arc::new(make_config()?);
@@ -293,24 +303,24 @@ pub fn serve_forever<F: FnMut(&mut Connections)>(mut work: F) -> Result<(), Erro
     loop {
         poll.poll(&mut events, None)?;
 
+        let mut useful_tokens = HashSet::with_capacity(4);
+
         // handle accepting and reading/writing data from/to active connections
         for event in events.iter() {
             match event.token() {
                 LISTENER => tlsserv.accept(&mut poll)?,
                 client => {
                     if let Some(conn) = tlsserv.connections.get_mut(&client) {
-                        conn.handle_readiness(event.readiness())?;
+                        if conn.handle_readiness(event.readiness())? {
+                            useful_tokens.insert(client);
+                        }
                     }
                 }
             }
         }
 
-        // TODO: we don't need to do work, or re-register for all clients here,
-        // TODO: but, by doing so, we make sure we don't miss anything.
-        // TODO: is the performance relevant?
-
-        // do useful application work on all clients
-        work(&mut tlsserv.connections);
+        // do useful application work on clients
+        work(&useful_tokens, &mut tlsserv.connections);
 
         // check if any of the work we did means there's more networking work to do
         for conn in tlsserv.connections.values_mut() {

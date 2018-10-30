@@ -74,7 +74,7 @@ impl Default for PreAuthPing {
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-struct ChannelId(i64);
+pub struct ChannelId(i64);
 
 struct Client {
     account_id: i64,
@@ -130,6 +130,29 @@ struct ErrorResponse {
     message: &'static str,
 }
 
+struct Event {
+    token: mio::Token,
+    op: EventOperation,
+}
+
+enum EventOperation {
+    DaemonReply(String),
+    RawReply(String),
+    DaemonReplyError(ErrorCode, &'static str),
+    CloseClient,
+}
+
+impl std::convert::From<(mio::Token, EventOperation)> for Event {
+    fn from(arg: (mio::Token, EventOperation)) -> Self {
+        Event {
+            token: arg.0,
+            op: arg.1,
+        }
+    }
+}
+
+use self::EventOperation as EO;
+
 impl System {
     fn new() -> Result<System, Error> {
         Ok(System {
@@ -139,9 +162,58 @@ impl System {
         })
     }
 
-    fn work(&mut self, connections: &mut serv::Connections) {
-        let all_tokens: Vec<mio::Token> = connections.keys().cloned().collect();
-        for token in all_tokens {
+    fn work(&mut self, tokens: &HashSet<mio::Token>, connections: &mut serv::Connections) {
+        // we expect there to be only one message per client
+        let mut messages = Vec::with_capacity(tokens.len());
+
+        for token in tokens {
+            if let Some(client) = connections.get_mut(token) {
+                if let Err(e) = take_messages(client, |message| messages.push((*token, message))) {
+                    info!(
+                        "{:?}: error handling a client's message buffer, bye: {:?}",
+                        token, e
+                    );
+                    client.start_closing();
+                }
+            } else {
+                unreachable!("server said there was work for a connection, but it's gone")
+            }
+        }
+
+        let mut events = Vec::with_capacity(messages.len());
+
+        for (token, message) in messages {
+            events.extend(self.translate_message(token, message).expect("TODO"));
+        }
+
+        for event in events {
+            match event.op {
+                EO::RawReply(msg) => {
+                    if let Some(conn) = connections.get_mut(&event.token) {
+                        conn.write_line(msg).expect("TODO");
+                    }
+                }
+                EO::DaemonReply(msg) => {
+                    if let Some(conn) = connections.get_mut(&event.token) {
+                        conn.write_line(format!(":ircd {}", msg)).expect("TODO");
+                    }
+                }
+                EO::DaemonReplyError(code, msg) => {
+                    if let Some(conn) = connections.get_mut(&event.token) {
+                        conn.write_line(format!(":ircd {:03} :{}", code.into_numeric(), msg))
+                            .expect("TODO");
+                    }
+                }
+                EO::CloseClient => {
+                    if let Some(conn) = connections.get_mut(&event.token) {
+                        conn.start_closing();
+                    }
+                }
+            }
+        }
+
+        #[cfg(never)]
+        for token in tokens.into_iter().cloned() {
             let mut conn = connections.remove(&token).expect("iterating");
             let mut removed_client = self.clients.remove(&token);
 
@@ -180,56 +252,97 @@ impl System {
         }
     }
 
-    /// https://modern.ircdocs.horse/#connection-registration
-    fn handle_pre_auth(
+    fn translate_message(
         &mut self,
-        conn: &mut serv::Connection,
+        token: mio::Token,
         message: Message,
+    ) -> Result<Vec<Event>, Error> {
+        let mut events = Vec::new();
+        if let Some(mut client) = self.clients.remove(&token) {
+            let res =
+                self.handle_client_message(token, &mut client, message, |event| events.push(event));
+            self.clients.insert(token, client);
+            res?;
+        } else if let Some(client) =
+            self.handle_pre_auth(token, message, |event| events.push(event))?
+        {
+            assert!(
+                self.registering.remove(&token).is_some(),
+                "should be removing a registering client"
+            );
+            assert!(
+                self.clients.insert(token, client).is_none(),
+                "shouldn't be replacing an existing client"
+            );
+        }
+        Ok(events)
+    }
+
+    /// https://modern.ircdocs.horse/#connection-registration
+    fn handle_pre_auth<F: FnMut(Event)>(
+        &mut self,
+        token: mio::Token,
+        message: Message,
+        mut yield_event: F,
     ) -> Result<Option<Client>, Error> {
-        let mut state = self.registering.entry(conn.token).or_default();
+        let mut state = self.registering.entry(token).or_default();
 
         match message.command {
             Command::CAP(_, cmd, ref arg, _)
                 if CapSubCommand::LS == cmd && *arg == Some("302".to_string()) =>
             {
                 // We support nothing, hahaha!
-                conn.write_line(":ircd CAP * LS :")?;
+                yield_event((token, EO::DaemonReply("CAP * LS :".to_string())).into());
             }
             Command::PASS(pass) => state.pass = Some(pass),
             Command::NICK(nick) => {
                 if !valid_nick(&nick) {
-                    conn.write_line(&format!(
-                        ":ircd {} * :invalid nickname; ascii letters, numbers, _. 2-12",
-                        ErrorCode::ErroneousNickname.into_numeric()
-                    ))?;
+                    yield_event(
+                        (
+                            token,
+                            EO::DaemonReplyError(
+                                ErrorCode::ErroneousNickname,
+                                "invalid nickname; ascii letters, numbers, _. 2-12",
+                            ),
+                        )
+                            .into(),
+                    );
                     return Ok(None);
                 }
 
                 state.nick = Some(nick);
                 if state.ping == PreAuthPing::WaitingForNick {
                     state.ping = PreAuthPing::WaitingForPong;
-                    conn.write_line(&format!("PING :{:08x}", state.ping_token.0))?;
+                    yield_event(
+                        (
+                            token,
+                            EO::RawReply(format!("PING :{:08x}", state.ping_token.0)),
+                        )
+                            .into(),
+                    );
                 }
             }
             Command::USER(ident, _mode, real_name) => state.gecos = Some((ident, real_name)),
-            Command::PING(ref token, _) => send_pong(conn, token)?,
-            Command::PONG(ref token, _)
+            Command::PING(ref arg, _) => yield_event((token, send_pong(arg)).into()),
+            Command::PONG(ref arg, _)
                 if PreAuthPing::WaitingForPong == state.ping
-                    && u64::from_str_radix(token, 16) == Ok(state.ping_token.0) =>
+                    && u64::from_str_radix(arg, 16) == Ok(state.ping_token.0) =>
             {
                 state.ping = PreAuthPing::Complete
             }
             Command::Raw(ref raw, ..) if is_http_verb(raw) => {
                 info!("http command on channel: {:?}", raw);
                 // TODO: is it worth sending them anything?
-                conn.start_closing();
+                yield_event((token, EO::CloseClient).into());
             }
             other => {
-                info!("invalid pre-auth command: {:?}", other);
-                conn.write_line(&format!(
-                    ":ircd {} * :invalid pre-auth command",
-                    ErrorCode::NotRegistered.into_numeric()
-                ))?;
+                yield_event(
+                    (
+                        token,
+                        EO::DaemonReplyError(ErrorCode::NotRegistered, "invalid pre-auth command"),
+                    )
+                        .into(),
+                );
             }
         }
 
@@ -239,11 +352,17 @@ impl System {
         }
 
         if state.pass.is_none() {
-            conn.write_line(&format!(
-                ":ircd {} * :You must provide a password",
-                ErrorCode::PasswordMismatch.into_numeric()
-            ))?;
-            conn.start_closing();
+            yield_event(
+                (
+                    token,
+                    EO::DaemonReplyError(
+                        ErrorCode::PasswordMismatch,
+                        "You must provide a password",
+                    ),
+                )
+                    .into(),
+            );
+            yield_event((token, EO::CloseClient).into());
             return Ok(None);
         }
 
@@ -252,14 +371,20 @@ impl System {
         let account_id = match self.store.user(nick, state.pass.as_ref().unwrap())? {
             Some(id) => id,
             None => {
-                conn.write_line(&format!(
-                    concat!(
-                        ":ircd {} * :Incorrect password for account. If you don't know",
-                        " the password, you must use a different nick."
-                    ),
-                    ErrorCode::PasswordMismatch.into_numeric()
-                ))?;
-                conn.start_closing();
+                yield_event(
+                    (
+                        token,
+                        EO::DaemonReplyError(
+                            ErrorCode::PasswordMismatch,
+                            concat!(
+                                "Incorrect password for account. If you don't know",
+                                " the password, you must use a different nick."
+                            ),
+                        ),
+                    )
+                        .into(),
+                );
+                yield_event((token, EO::CloseClient).into());
                 return Ok(None);
             }
         };
@@ -268,33 +393,87 @@ impl System {
 
         // Minimal hello.
 
-        conn.write_line(format!(":ircd 001 {} :Hi!", nick))?;
-        conn.write_line(format!(":ircd 002 {} :This is IRC.", nick))?;
-        conn.write_line(format!(":ircd 003 {} :This server is.", nick))?;
-        conn.write_line(format!(":ircd 004 {} ircd badchat iZ s", nick))?;
-        conn.write_line(format!(
-            ":ircd 005 {} SAFELIST :are supported by this server",
-            nick
-        ))?;
+        yield_event((token, EO::RawReply(format!(":ircd 001 {} :Hi!", nick))).into());
+        yield_event(
+            (
+                token,
+                EO::RawReply(format!(":ircd 002 {} :This is IRC.", nick)),
+            )
+                .into(),
+        );
+        yield_event(
+            (
+                token,
+                EO::RawReply(format!(":ircd 003 {} :This server is.", nick)),
+            )
+                .into(),
+        );
+        yield_event(
+            (
+                token,
+                EO::RawReply(format!(":ircd 004 {} ircd badchat iZ s", nick)),
+            )
+                .into(),
+        );
+        yield_event(
+            (
+                token,
+                EO::RawReply(format!(
+                    ":ircd 005 {} SAFELIST :are supported by this server",
+                    nick
+                )),
+            )
+                .into(),
+        );
 
         // Minimal LUSERS
 
-        conn.write_line(format!(":ircd 251 {} :There are users.", nick))?;
-        conn.write_line(format!(":ircd 254 {} 69 :channels formed", nick))?;
-        conn.write_line(format!(":ircd 255 {} :I have clients and servers.", nick))?;
-        conn.write_line(format!(
-            ":ircd 265 {} 69 69 :Current local users are nice.",
-            nick
-        ))?;
+        yield_event(
+            (
+                token,
+                EO::RawReply(format!(":ircd 251 {} :There are users.", nick)),
+            )
+                .into(),
+        );
+        yield_event(
+            (
+                token,
+                EO::RawReply(format!(":ircd 254 {} 69 :channels formed", nick)),
+            )
+                .into(),
+        );
+        yield_event(
+            (
+                token,
+                EO::RawReply(format!(":ircd 255 {} :I have clients and servers.", nick)),
+            )
+                .into(),
+        );
+        yield_event(
+            (
+                token,
+                EO::RawReply(format!(
+                    ":ircd 265 {} 69 69 :Current local users are nice.",
+                    nick
+                )),
+            )
+                .into(),
+        );
 
         // Minimal MOTD
 
-        conn.write_line(format!(
-            ":ircd 422 {} :MOTDs haven't been cool for decades.",
-            nick
-        ))?;
+        yield_event(
+            (
+                token,
+                EO::RawReply(format!(
+                    ":ircd 422 {} :MOTDs haven't been cool for decades.",
+                    nick
+                )),
+            )
+                .into(),
+        );
 
-        conn.write_line(format!(":{} MODE {0} :+iZ", nick))?;
+        yield_event((token, EO::RawReply(format!(":{} MODE {0} :+iZ", nick))).into());
 
         Ok(Some(Client {
             account_id,
@@ -303,14 +482,13 @@ impl System {
         }))
     }
 
-    fn handle_client_message(
+    fn handle_client_message<F: FnMut(Event)>(
         &mut self,
-        conns: &mut serv::Connections,
-        conn: &mut serv::Connection,
+        token: mio::Token,
         client: &mut Client,
         message: Message,
+        mut yield_event: F,
     ) -> Result<(), Error> {
-        let token = conn.token;
         match message.command {
             Command::JOIN(ref chan, ref keys, ref real_name)
                 if keys.is_none() && real_name.is_none() =>
@@ -321,11 +499,23 @@ impl System {
                     return Ok(());
                 }
                 // client joins, 322 topic, 333 topic who/time, 353 users, 366 end of names
-                conn.write_line(&format!(":{}!~@irc JOIN {}", client.nick, chan))?;
-                conn.write_line(&format!(
-                    ":ircd 332 {} {} :This topic intentionally left blank.",
-                    client.nick, chan
-                ))?;
+                yield_event(
+                    (
+                        token,
+                        EO::RawReply(format!(":{}!~@irc JOIN {}", client.nick, chan)),
+                    )
+                        .into(),
+                );
+                yield_event(
+                    (
+                        token,
+                        EO::RawReply(format!(
+                            ":ircd 332 {} {} :This topic intentionally left blank.",
+                            client.nick, chan
+                        )),
+                    )
+                        .into(),
+                );
                 // @: secret channel (+s)
                 // TODO: client modes in a channel
                 // TODO: splitting into multiple lines
@@ -336,8 +526,23 @@ impl System {
                     .map(|client| client.nick.as_ref())
                     .collect::<Vec<&str>>()
                     .join(" ");
-                conn.write_line(&format!(":ircd 353 {} @ {} :{}", client.nick, chan, names))?;
-                conn.write_line(&format!(":ircd 366 {} {} :</names>", client.nick, chan))?;
+                yield_event(
+                    (
+                        token,
+                        EO::RawReply(format!(
+                            ":ircd 353 {} @ {} :{} {}",
+                            client.nick, chan, client.nick, names
+                        )),
+                    )
+                        .into(),
+                );
+                yield_event(
+                    (
+                        token,
+                        EO::RawReply(format!(":ircd 366 {} {} :</names>", client.nick, chan)),
+                    )
+                        .into(),
+                );
             }
             Command::PRIVMSG(dest, msg) => {
                 if dest.starts_with("#") {
@@ -347,38 +552,50 @@ impl System {
                             continue;
                         }
 
-                        // TODO: HMMMMM, are we penalising users for other people having network
-                        // TODO: errors here? That would be lame.
-                        if let Some(other) = conns.get_mut(other_token) {
-                            other.write_line(&format!(
-                                ":{}!~@irc PRIVMSG {} :{}",
-                                client.nick, dest, msg
-                            ))?;
-                        }
+                        yield_event(
+                            (
+                                *other_token,
+                                EO::RawReply(format!(
+                                    ":{}!~@irc PRIVMSG {} :{}",
+                                    client.nick, dest, msg
+                                )),
+                            )
+                                .into(),
+                        );
                     }
+                } else {
+                    unimplemented!("non-channel message");
                 }
             }
-            Command::PING(ref token, _) => send_pong(conn, token)?,
+            Command::PING(ref arg, _) => yield_event((token, send_pong(arg)).into()),
             Command::PONG(..) => (),
             other => {
                 info!("invalid command: {:?}", other);
-                conn.write_line(&format!(
-                    ":ircd {} {} ? :unrecognised or mis-parsed command: {:?}",
-                    ErrorCode::UnknownCommand.into_numeric(),
-                    client.nick,
-                    other,
-                ))?;
+                yield_event(
+                    (
+                        token,
+                        EO::RawReply(format!(
+                            ":ircd {} {} ? :unrecognised or mis-parsed command: {:?}",
+                            ErrorCode::UnknownCommand.into_numeric(),
+                            client.nick,
+                            other,
+                        )),
+                    )
+                        .into(),
+                );
             }
         }
         Ok(())
     }
 }
 
-fn take_messages(conn: &mut serv::Connection) -> Result<Vec<irc_proto::Message>, Error> {
-    let mut messages = Vec::with_capacity(conn.input_buffer.len() / 32);
+fn take_messages<F: FnMut(irc_proto::Message)>(
+    conn: &mut serv::Connection,
+    mut yield_into: F,
+) -> Result<(), Error> {
     loop {
         match line_to_message(conn.token, &mut conn.input_buffer) {
-            Ok(Some(message)) => messages.push(message),
+            Ok(Some(message)) => yield_into(message),
             Ok(None) => break,
             Err(response) => {
                 conn.write_line(&format!(
@@ -395,24 +612,30 @@ fn take_messages(conn: &mut serv::Connection) -> Result<Vec<irc_proto::Message>,
             ":ircd {} * :Your input buffer is full, bye.",
             ErrorCode::LineTooLong.into_numeric(),
         ))?;
-        conn.start_closing();
 
         // TODO: mmm, in theory, we might start processing a command at the middle of their input...
         // TODO: we should probably stop accepting input from people who are `closing` further up
         conn.input_buffer.clear();
+
+        bail!("input buffer got too long");
     }
 
-    Ok(messages)
+    Ok(())
 }
 
-fn line_to_message(token: mio::Token, input_buffer: &mut VecDeque<u8>) -> Result<Option<irc_proto::Message>, ErrorResponse> {
+fn line_to_message(
+    token: mio::Token,
+    input_buffer: &mut VecDeque<u8>,
+) -> Result<Option<irc_proto::Message>, ErrorResponse> {
     let line = match pop_line(input_buffer) {
         PoppedLine::Done(line) => line,
         PoppedLine::NotReady => return Ok(None),
-        PoppedLine::TooLong => return Err(ErrorResponse {
-            code: ErrorCode::LineTooLong,
-            message: "Your message was discarded as it was too long",
-        })
+        PoppedLine::TooLong => {
+            return Err(ErrorResponse {
+                code: ErrorCode::LineTooLong,
+                message: "Your message was discarded as it was too long",
+            })
+        }
     };
 
     let line = String::from_utf8(line).map_err(|parse_error| {
@@ -434,10 +657,9 @@ fn line_to_message(token: mio::Token, input_buffer: &mut VecDeque<u8>) -> Result
     })?))
 }
 
-fn send_pong(conn: &mut serv::Connection, token: &str) -> Result<(), Error> {
+fn send_pong(token: &str) -> EO {
     // TODO: validate the token isn't insane
-    conn.write_line(format!("PONG :{}", token))?;
-    Ok(())
+    EO::RawReply(format!("PONG :{}", token))
 }
 
 fn is_http_verb(word: &str) -> bool {
@@ -500,6 +722,8 @@ fn main() -> Result<(), Error> {
 
     let mut system = System::new()?;
 
-    Ok(serv::serve_forever(|connections| system.work(connections))
-        .with_context(|_| format_err!("running server"))?)
+    Ok(
+        serv::serve_forever(|tokens, connections| system.work(tokens, connections))
+            .with_context(|_| format_err!("running server"))?,
+    )
 }
