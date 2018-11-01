@@ -135,7 +135,7 @@ fn check_pass(pass: &str, hashed: &str) -> bool {
         Ok(()) => true,
         Err(CheckError::HashMismatch) => false,
         Err(e) => {
-            error!("pass parsing failed: {:?}", hashed);
+            error!("pass parsing failed: {:?}: {:?}", hashed, e);
             false
         }
     }

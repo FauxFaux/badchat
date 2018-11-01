@@ -83,6 +83,9 @@ pub struct Connection {
     closed: bool,
     tls_session: rustls::ServerSession,
     pub input_buffer: VecDeque<u8>,
+
+    /// The client angered us. We are discarding until they send us a line break.
+    pub broken_input: bool,
 }
 
 impl Connection {
@@ -94,6 +97,7 @@ impl Connection {
             closed: false,
             tls_session,
             input_buffer: VecDeque::new(),
+            broken_input: false,
         }
     }
 

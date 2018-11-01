@@ -22,7 +22,6 @@ use std::fmt;
 
 use failure::Error;
 use failure::ResultExt;
-use irc_proto::CapSubCommand;
 use irc_proto::Command;
 use irc_proto::Message;
 use rand::Rng;
@@ -133,12 +132,6 @@ impl ErrorCode {
     }
 }
 
-#[derive(Copy, Clone)]
-struct ErrorResponse {
-    code: ErrorCode,
-    message: &'static str,
-}
-
 #[derive(Debug)]
 enum Req {
     OnBoard,
@@ -150,11 +143,11 @@ enum Req {
     CloseClient,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone)]
 enum ClientError {
     ErrorReason(ErrorCode, &'static str),
     ErrorNickReason(ErrorCode, &'static str),
-    ErrorWordReason(ErrorCode, String, &'static str),
+    ErrorWordReason(ErrorCode, &'static str, &'static str),
 }
 
 enum PreAuthOp {
@@ -180,13 +173,7 @@ impl System {
 
         for token in tokens {
             if let Some(client) = connections.get_mut(token) {
-                if let Err(e) = take_messages(client, |message| messages.push((*token, message))) {
-                    info!(
-                        "{:?}: error handling a client's message buffer, bye: {:?}",
-                        token, e
-                    );
-                    client.start_closing();
-                }
+                messages.extend(take_messages(client).into_iter().map(|r| (*token, r)));
             } else {
                 unreachable!("server said there was work for a connection, but it's gone")
             }
@@ -195,6 +182,14 @@ impl System {
         let mut output = Vec::with_capacity(messages.len());
 
         for (token, message) in messages {
+            let message = match message {
+                Ok(message) => message,
+                Err(e) => {
+                    self.send_error(e);
+                    continue;
+                },
+            };
+
             match self.translate_message(token, message) {
                 Ok(events) => {
                     for event in events {
@@ -209,7 +204,7 @@ impl System {
         }
 
         for (token, line) in output {
-            if let Some(mut conn) = connections.get_mut(&token) {
+            if let Some(conn) = connections.get_mut(&token) {
                 if let Err(e) = conn.write_line(line) {
                     info!("{:?}: error sending normal message: {:?}", token, e);
                     conn.start_closing();
@@ -385,7 +380,7 @@ impl System {
                     } else {
                         return Err(ClientError::ErrorWordReason(
                             ErrorCode::InvalidChannel,
-                            "*".to_string(),
+                            "*",
                             "channel name invalid",
                         ));
                     }
@@ -400,7 +395,7 @@ impl System {
                 } else {
                     Err(ClientError::ErrorWordReason(
                         ErrorCode::NoSuchNick,
-                        "*".to_string(),
+                        "*",
                         "invalid channel or nickname",
                     ))
                 }
@@ -526,38 +521,38 @@ impl System {
     }
 }
 
-fn take_messages<F: FnMut(irc_proto::Message)>(
+fn take_messages(
     conn: &mut serv::Connection,
-    mut yield_into: F,
-) -> Result<(), Error> {
-    loop {
-        match line_to_message(conn.token, &mut conn.input_buffer) {
-            Ok(Some(message)) => yield_into(message),
-            Ok(None) => break,
-            Err(response) => {
-                conn.write_line(&format!(
-                    ":ircd {} * :{}",
-                    response.code.into_numeric(),
-                    response.message,
-                ))?;
+) -> Vec<Result<irc_proto::Message, ClientError>> {
+    if conn.broken_input {
+        match pop_line(&mut conn.input_buffer) {
+            PoppedLine::Done(_) | PoppedLine::TooLong => {
+                conn.broken_input = false;
+            }
+            PoppedLine::NotReady => {
+                conn.input_buffer.clear();
+                return Vec::new();
             }
         }
     }
 
-    if conn.input_buffer.len() > 10 * INPUT_LENGTH_LIMIT {
-        conn.write_line(&format!(
-            ":ircd {} * :Your input buffer is full, bye.",
-            ErrorCode::LineTooLong.into_numeric(),
-        ))?;
-
-        // TODO: mmm, in theory, we might start processing a command at the middle of their input...
-        // TODO: we should probably stop accepting input from people who are `closing` further up
-        conn.input_buffer.clear();
-
-        bail!("input buffer got too long");
+    let mut output = Vec::with_capacity(4);
+    loop {
+        match line_to_message(conn.token, &mut conn.input_buffer) {
+            Ok(Some(message)) => output.push(Ok(message)),
+            Ok(None) => break,
+            Err(response) => output.push(Err(response)),
+        }
     }
 
-    Ok(())
+    if conn.input_buffer.len() > 10 * INPUT_LENGTH_LIMIT {
+        output.push(Err(ClientError::ErrorReason(ErrorCode::LineTooLong, "Your input buffer is full.")));
+
+        conn.broken_input = true;
+        conn.input_buffer.clear();
+    }
+
+    output
 }
 
 fn send_on_boarding<D: fmt::Display>(nick: D) -> Vec<String> {
@@ -598,34 +593,25 @@ fn send_on_boarding<D: fmt::Display>(nick: D) -> Vec<String> {
 fn line_to_message(
     token: mio::Token,
     input_buffer: &mut VecDeque<u8>,
-) -> Result<Option<irc_proto::Message>, ErrorResponse> {
+) -> Result<Option<irc_proto::Message>, ClientError> {
     let line = match pop_line(input_buffer) {
         PoppedLine::Done(line) => line,
         PoppedLine::NotReady => return Ok(None),
         PoppedLine::TooLong => {
-            return Err(ErrorResponse {
-                code: ErrorCode::LineTooLong,
-                message: "Your message was discarded as it was too long",
-            });
+            return Err(ClientError::ErrorReason( ErrorCode::LineTooLong, "Your message was discarded as it was too long"));
         }
     };
 
     let line = String::from_utf8(line).map_err(|parse_error| {
         debug!("{:?}: {:?}", token, parse_error);
-        ErrorResponse {
-            code: ErrorCode::BadCharEncoding,
-            message: "Your line was discarded as it was not encoded using 'utf-8'",
-        }
+        ClientError::ErrorReason( ErrorCode::BadCharEncoding, "Your line was discarded as it was not encoded using 'utf-8'")
     })?;
 
     trace!("{:?}: line: {:?}", token, line);
 
     Ok(Some(line.parse().map_err(|parse_error| {
         debug!("{:?}: bad command: {:?} {:?}", token, line, parse_error);
-        ErrorResponse {
-            code: ErrorCode::UnknownError,
-            message: "Unable to parse your input as any form of message",
-        }
+        ClientError::ErrorReason(  ErrorCode::UnknownError, "Unable to parse your input as any form of message")
     })?))
 }
 
@@ -690,10 +676,6 @@ fn valid_nick(nick: &str) -> bool {
 
 fn valid_nick_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || "_".contains(c)
-}
-
-fn raw<S: ToString>(whole: S) -> Req {
-    unimplemented!()
 }
 
 fn main() -> Result<(), Error> {
