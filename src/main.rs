@@ -20,7 +20,6 @@ use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::fmt;
 
-use self::EventOperation as EO;
 use failure::Error;
 use failure::ResultExt;
 use irc_proto::CapSubCommand;
@@ -141,10 +140,10 @@ struct ErrorResponse {
 }
 
 #[derive(Debug)]
-enum EventOperation {
-    SendMessage(String),
-    JoinChannel(ChannelId),
-    MessageChannel(ChannelId, String),
+enum Req {
+    OnBoard,
+    JoinChannel(String),
+    MessageChannel(String, String),
     MessageIndividual(String, String),
     Ping(String),
     Pong(String),
@@ -152,7 +151,7 @@ enum EventOperation {
 }
 
 #[derive(Debug)]
-enum EOError {
+enum ClientError {
     ErrorReason(ErrorCode, &'static str),
     ErrorNickReason(ErrorCode, &'static str),
     ErrorWordReason(ErrorCode, String, &'static str),
@@ -161,9 +160,9 @@ enum EOError {
 enum PreAuthOp {
     Waiting,
     Complete(Client),
-    Event(EO),
-    Error(EOError),
-    FatalError(EOError),
+    Request(Req),
+    Error(ClientError),
+    FatalError(ClientError),
 }
 
 impl System {
@@ -199,7 +198,7 @@ impl System {
             match self.translate_message(token, message) {
                 Ok(events) => {
                     for event in events {
-                        match self.translate_event(token, event).expect("TODO") {
+                        match self.translate_event(token, event) {
                             Ok(lines) => output.extend(lines),
                             Err(e) => self.send_error(e),
                         }
@@ -220,11 +219,11 @@ impl System {
         &mut self,
         token: mio::Token,
         message: Message,
-    ) -> Result<Vec<EO>, EOError> {
+    ) -> Result<Vec<Req>, ClientError> {
         if self.clients.contains_key(&token) {
             self.translate_client_message(message)
         } else {
-            match self.translate_pre_auth(token, message)? {
+            match self.translate_pre_auth(token, message) {
                 PreAuthOp::Waiting => Ok(vec![]),
                 PreAuthOp::Complete(client) => {
                     assert!(
@@ -235,9 +234,9 @@ impl System {
                         self.clients.insert(token, client).is_none(),
                         "shouldn't be replacing an existing client"
                     );
-                    Ok(Vec::new())
+                    Ok(vec![Req::OnBoard])
                 }
-                PreAuthOp::Event(eo) => Ok(vec![eo]),
+                PreAuthOp::Request(req) => Ok(vec![req]),
                 PreAuthOp::Error(eo) => Err(eo),
                 // TODO: make this actually fatal
                 PreAuthOp::FatalError(eo) => Err(eo),
@@ -248,80 +247,81 @@ impl System {
     fn translate_event(
         &mut self,
         token: mio::Token,
-        event: EO,
-    ) -> Result<Result<Vec<(mio::Token, String)>, EOError>, Error> {
+        event: Req,
+    ) -> Result<Vec<(mio::Token, String)>, ClientError> {
         let mut output = Vec::with_capacity(4);
 
-        let client = match self.clients.get_mut(&token) {
-            Some(client) => client,
-            None => bail!("invalid client"),
-        };
+        let nick = self
+            .clients
+            .get(&token)
+            .expect("invalid client")
+            .nick
+            .to_string();
 
         match event {
-            EO::JoinChannel(channel) => self.joined(
+            Req::OnBoard => output.extend(
+                send_on_boarding(&nick)
+                    .into_iter()
+                    .map(|line| (token, line)),
+            ),
+            Req::JoinChannel(channel) => self.joined(
                 token,
                 unimplemented!(),
                 |_, _| unimplemented!(),
                 unimplemented!(),
                 unimplemented!(),
             ),
-            EO::SendMessage(msg) => output.push((token, msg)),
-            EO::MessageIndividual(other_nick, msg) => output.push((
+            Req::MessageIndividual(other_nick, msg) => output.push((
                 token,
-                format!("{}!~@irc PRIVMSG {} :{}", client.nick, other_nick, msg),
+                format!("{}!~@irc PRIVMSG {} :{}", nick, other_nick, msg),
             )),
-            EO::MessageChannel(channel, _msg) => self.message_channel(channel),
-            EO::Ping(symbol) => output.push((token, format!("PING :{}", symbol))),
-            EO::Pong(symbol) => output.push((token, format!("PONG :{}", symbol))),
-            EO::CloseClient => unimplemented!(),
+            Req::MessageChannel(ref channel, ref msg) => {
+                output.extend(self.message_channel(token, &nick, channel, msg))
+            }
+            Req::Ping(symbol) => output.push((token, format!("PING :{}", symbol))),
+            Req::Pong(symbol) => output.push((token, format!("PONG :{}", symbol))),
+            Req::CloseClient => unimplemented!(),
         }
 
-        Ok(Ok(output))
+        Ok(output)
     }
 
-    fn send_error(&mut self, err: EOError) {
+    fn send_error(&mut self, err: ClientError) {
         #[cfg(never)]
         match err {
-            EO::ErrorReason(code, msg) => {
+            Req::ErrorReason(code, msg) => {
                 output.push((token, format!(":ircd {:03} :{}", code.into_numeric(), msg)))
             }
-            EO::ErrorNickReason(code, msg) => unimplemented!(),
-            EO::ErrorWordReason(code, word, msg) => unimplemented!(),
+            Req::ErrorNickReason(code, msg) => unimplemented!(),
+            Req::ErrorWordReason(code, word, msg) => unimplemented!(),
         }
 
         unimplemented!()
     }
 
     /// https://modern.ircdocs.horse/#connection-registration
-    fn translate_pre_auth(
-        &mut self,
-        token: mio::Token,
-        message: Message,
-    ) -> Result<PreAuthOp, Error> {
+    fn translate_pre_auth(&mut self, token: mio::Token, message: Message) -> PreAuthOp {
         let mut state = self.registering.entry(token).or_default();
 
         match message.command {
             Command::PASS(pass) => state.pass = Some(pass),
             Command::NICK(nick) => {
                 if !valid_nick(&nick) {
-                    return Ok(PreAuthOp::Error(EOError::ErrorNickReason(
+                    return PreAuthOp::Error(ClientError::ErrorNickReason(
                         ErrorCode::ErroneousNickname,
                         "invalid nickname; ascii letters, numbers, _. 2-12",
-                    )));
+                    ));
                 }
 
                 state.nick = Some(nick);
 
                 if state.ping == PreAuthPing::WaitingForNick {
                     state.ping = PreAuthPing::WaitingForPong;
-                    return Ok(PreAuthOp::Event(EO::Ping(format!(
-                        "{:08x}",
-                        state.ping_token.0
-                    ))));
+                    return PreAuthOp::Request(Req::Ping(format!("{:08x}", state.ping_token.0)));
                 }
             }
             Command::USER(ident, _mode, real_name) => state.gecos = Some((ident, real_name)),
-            Command::PING(arg, _trail) => return Ok(PreAuthOp::Event(EO::Pong(arg))),
+            Command::PING(arg, _trail) => return PreAuthOp::Request(Req::Pong(arg)),
             Command::PONG(ref arg, _)
                 if PreAuthPing::WaitingForPong == state.ping
                     && u64::from_str_radix(arg, 16) == Ok(state.ping_token.0) =>
@@ -331,26 +331,26 @@ impl System {
             Command::Raw(ref raw, ..) if is_http_verb(raw) => {
                 info!("http command on channel: {:?}", raw);
                 // TODO: is it worth sending them anything?
-                return Ok(PreAuthOp::Event(EO::CloseClient));
+                return PreAuthOp::Request(Req::CloseClient);
             }
             other => {
-                return Ok(PreAuthOp::Error(EOError::ErrorReason(
+                return PreAuthOp::Error(ClientError::ErrorReason(
                     ErrorCode::NotRegistered,
                     "invalid pre-auth command",
-                )));
+                ));
             }
         }
 
         if !state.is_client_preamble_done() {
             info!("waiting for more from client...");
-            return Ok(PreAuthOp::Waiting);
+            return PreAuthOp::Waiting;
         }
 
         if state.pass.is_none() {
-            return Ok(PreAuthOp::FatalError(EOError::ErrorReason(
+            return PreAuthOp::FatalError(ClientError::ErrorReason(
                 ErrorCode::PasswordMismatch,
                 "You must provide a password",
-            )));
+            ));
         }
 
         let nick = state.nick.as_ref().unwrap();
@@ -358,29 +358,24 @@ impl System {
         let account_id = match self.store.user(nick, state.pass.as_ref().unwrap()) {
             Some(id) => id,
             None => {
-                return Ok(PreAuthOp::FatalError(EOError::ErrorReason(
+                return PreAuthOp::FatalError(ClientError::ErrorReason(
                     ErrorCode::PasswordMismatch,
                     concat!(
                         "Incorrect password for account. If you don't know",
                         " the password, you must use a different nick."
                     ),
-                )));
+                ));
             }
         };
 
-        send_onboarding(token, nick);
-
-        Ok(PreAuthOp::Complete(Client {
+        PreAuthOp::Complete(Client {
             account_id,
             nick: nick.to_string(),
             channels: HashSet::new(),
-        }))
+        })
     }
 
-    fn translate_client_message(
-        &mut self,
-        message: Message,
-    ) -> Result<Vec<EO>, EOError> {
+    fn translate_client_message(&mut self, message: Message) -> Result<Vec<Req>, ClientError> {
         match message.command {
             Command::JOIN(ref chan, ref keys, ref real_name)
                 if keys.is_none() && real_name.is_none() =>
@@ -389,9 +384,9 @@ impl System {
                 for chan in chan.split(',') {
                     let chan: &str = chan.trim();
                     if valid_channel(chan) {
-                        joins.push(EO::JoinChannel(self.store.load_channel(chan)))
+                        joins.push(Req::JoinChannel(chan.to_string()))
                     } else {
-                        return Err(EOError::ErrorWordReason(
+                        return Err(ClientError::ErrorWordReason(
                             ErrorCode::InvalidChannel,
                             "*".to_string(),
                             "channel name invalid",
@@ -402,25 +397,22 @@ impl System {
             }
             Command::PRIVMSG(dest, msg) => {
                 if dest.starts_with('#') && valid_channel(&dest) {
-                    Ok(vec![EO::MessageChannel(
-                        self.store.load_channel(&dest),
-                        msg,
-                    )])
+                    Ok(vec![Req::MessageChannel(dest, msg)])
                 } else if valid_nick(&dest) {
-                    Ok(vec![EO::MessageIndividual(dest, msg)])
+                    Ok(vec![Req::MessageIndividual(dest, msg)])
                 } else {
-                    Err(EOError::ErrorWordReason(
+                    Err(ClientError::ErrorWordReason(
                         ErrorCode::NoSuchNick,
                         "*".to_string(),
                         "invalid channel or nickname",
                     ))
                 }
             }
-            Command::PING(arg, _) => Ok(vec![EO::Pong(arg)]),
+            Command::PING(arg, _) => Ok(vec![Req::Pong(arg)]),
             Command::PONG(..) => Ok(vec![]),
             other => {
                 info!("invalid command: {:?}", other);
-                Err(EOError::ErrorNickReason(
+                Err(ClientError::ErrorNickReason(
                     ErrorCode::UnknownCommand,
                     "unrecognised or mis-parsed command",
                 ))
@@ -428,17 +420,37 @@ impl System {
         }
     }
 
-    fn message_channel(&self, id: ChannelId) {
+    fn message_channel(
+        &mut self,
+        us: mio::Token,
+        our_nick: &str,
+        channel: &str,
+        msg: &str,
+    ) -> Vec<(mio::Token, String)> {
+        let mut output = Vec::with_capacity(32);
+
+        let id = self.store.load_channel(channel);
+
         for (other_token, other_client) in &self.clients {
+            if *other_token == us {
+                // don't message ourselves
+                continue;
+            }
+
             if !other_client.channels.contains(&id) {
                 continue;
             }
-            let op = raw(format!(":{}!~@irc PRIVMSG {} :{}", "nick", "dest", "msg"));
-            unimplemented!("yield event {:?}", op);
+
+            output.push((
+                *other_token,
+                format!(":{}!~@irc PRIVMSG {} :{}", our_nick, channel, msg),
+            ));
         }
+
+        output
     }
 
-    fn joined<F: FnMut(mio::Token, EO)>(
+    fn joined<F: FnMut(mio::Token, Req)>(
         &mut self,
         token: mio::Token,
         client: &Client,
@@ -513,51 +525,39 @@ fn take_messages<F: FnMut(irc_proto::Message)>(
     Ok(())
 }
 
-fn send_onboarding(token: mio::Token, nick: &String) {
-    fn yield_event<T>(token: mio::Token, msg: T) {
-        unimplemented!()
-    }
+fn send_on_boarding<D: fmt::Display>(nick: D) -> Vec<String> {
+    let mut output = Vec::with_capacity(16);
 
     // This is all legacy garbage. Trying to get any possible client to continue the connection.
 
     // Minimal hello.
-    yield_event(token, raw(format!(":ircd 001 {} :Hi!", nick)));
-    yield_event(token, raw(format!(":ircd 002 {} :This is IRC.", nick)));
-    yield_event(token, raw(format!(":ircd 003 {} :This server is.", nick)));
-    yield_event(token, raw(format!(":ircd 004 {} ircd badchat iZ s", nick)));
-    yield_event(
-        token,
-        raw(format!(
-            ":ircd 005 {} SAFELIST :are supported by this server",
-            nick
-        )),
-    );
+    output.push(format!(":ircd 001 {} :Hi!", nick));
+    output.push(format!(":ircd 002 {} :This is IRC.", nick));
+    output.push(format!(":ircd 003 {} :This server is.", nick));
+    output.push(format!(":ircd 004 {} ircd badchat iZ s", nick));
+    output.push(format!(
+        ":ircd 005 {} SAFELIST :are supported by this server",
+        nick
+    ));
+
     // Minimal LUSERS
-    yield_event(token, raw(format!(":ircd 251 {} :There are users.", nick)));
-    yield_event(
-        token,
-        raw(format!(":ircd 254 {} 69 :channels formed", nick)),
-    );
-    yield_event(
-        token,
-        raw(format!(":ircd 255 {} :I have clients and servers.", nick)),
-    );
-    yield_event(
-        token,
-        raw(format!(
-            ":ircd 265 {} 69 69 :Current local users are nice.",
-            nick
-        )),
-    );
+    output.push(format!(":ircd 251 {} :There are users.", nick));
+    output.push(format!(":ircd 254 {} 69 :channels formed", nick));
+    output.push(format!(":ircd 255 {} :I have clients and servers.", nick));
+    output.push(format!(
+        ":ircd 265 {} 69 69 :Current local users are nice.",
+        nick
+    ));
+
     // Minimal MOTD
-    yield_event(
-        token,
-        raw(format!(
-            ":ircd 422 {} :MOTDs haven't been cool for decades.",
-            nick
-        )),
-    );
-    yield_event(token, raw(format!(":{} MODE {0} :+iZ", nick)));
+    output.push(format!(
+        ":ircd 422 {} :MOTDs haven't been cool for decades.",
+        nick
+    ));
+
+    output.push(format!(":{} MODE {0} :+iZ", nick));
+
+    output
 }
 
 fn line_to_message(
@@ -657,8 +657,8 @@ fn valid_nick_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || "_".contains(c)
 }
 
-fn raw<S: ToString>(whole: S) -> EO {
-    EO::SendMessage(whole.to_string())
+fn raw<S: ToString>(whole: S) -> Req {
+    unimplemented!()
 }
 
 fn main() -> Result<(), Error> {

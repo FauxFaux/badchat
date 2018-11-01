@@ -40,8 +40,10 @@ impl Store {
         };
 
         for hashed in tx
-            .prepare_cached("select pass from account_pass where account_id=?").unwrap_system()
-            .query_map(&[account_id], |row| row.get::<_, String>(0)).unwrap_system()
+            .prepare_cached("select pass from account_pass where account_id=?")
+            .unwrap_system()
+            .query_map(&[account_id], |row| row.get::<_, String>(0))
+            .unwrap_system()
         {
             let hashed = hashed.unwrap_system();
             if check_pass(pass, &hashed) {
@@ -69,7 +71,9 @@ where
     P::Item: ToSql,
 {
     let mut stat = tx.prepare_cached(query).unwrap_system();
-    let mut query = stat.query_map(params, |row| row.get::<_, i64>(0)).unwrap_system();
+    let mut query = stat
+        .query_map(params, |row| row.get::<_, i64>(0))
+        .unwrap_system();
     if let Some(res) = query.next() {
         assert!(query.next().is_none(), "unexpected multiple rows");
         Some(res.unwrap_system())
@@ -81,14 +85,16 @@ where
 fn create_user(tx: Transaction, nick: &str, pass: &str) -> i64 {
     let now = unix_time();
 
-    tx.execute("insert into account (creation_time) values (?)", &[now]).unwrap_system();
+    tx.execute("insert into account (creation_time) values (?)", &[now])
+        .unwrap_system();
 
     let account_id = tx.last_insert_rowid();
 
     tx.execute(
         "insert into nick (nick, account_id) values (?,?)",
         &[&nick as &ToSql, &account_id],
-    ).unwrap_system();
+    )
+    .unwrap_system();
 
     tx.execute(
         "insert into account_pass (account_id, pass) values (?,?)",
@@ -96,7 +102,8 @@ fn create_user(tx: Transaction, nick: &str, pass: &str) -> i64 {
             &account_id as &ToSql,
             &pbkdf2_simple(pass, PBKDF2_ITERATION_COUNT).unwrap_system(),
         ],
-    ).unwrap_system();
+    )
+    .unwrap_system();
 
     tx.commit().unwrap_system();
 
@@ -111,7 +118,8 @@ fn create_channel(tx: Transaction, name: &str) -> i64 {
     tx.execute(
         "insert into channel (name, creation_time, mode) values (?,?,?)",
         &[&name as &ToSql, &now, &""],
-    ).unwrap_system();
+    )
+    .unwrap_system();
 
     let channel_id = tx.last_insert_rowid();
 
@@ -129,7 +137,7 @@ fn check_pass(pass: &str, hashed: &str) -> bool {
         Err(e) => {
             error!("pass parsing failed: {:?}", hashed);
             false
-        },
+        }
     }
 }
 
