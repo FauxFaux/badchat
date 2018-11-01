@@ -148,10 +148,22 @@ enum EventOperation {
     MessageIndividual(String, String),
     Ping(String),
     Pong(String),
+    CloseClient,
+}
+
+#[derive(Debug)]
+enum EOError {
     ErrorReason(ErrorCode, &'static str),
     ErrorNickReason(ErrorCode, &'static str),
     ErrorWordReason(ErrorCode, String, &'static str),
-    CloseClient,
+}
+
+enum PreAuthOp {
+    Waiting,
+    Complete(Client),
+    Event(EO),
+    Error(EOError),
+    FatalError(EOError),
 }
 
 impl System {
@@ -197,7 +209,8 @@ impl System {
                 None => continue,
             };
 
-            match event {
+            // TODO: list/error is a mess here
+            match event.unwrap().into_iter().next().unwrap() {
                 EO::JoinChannel(channel) => self.joined(
                     token,
                     unimplemented!(),
@@ -213,74 +226,79 @@ impl System {
                 EO::MessageChannel(channel, _msg) => self.message_channel(channel),
                 EO::Ping(symbol) => messages.push((token, format!("PING :{}", symbol))),
                 EO::Pong(symbol) => messages.push((token, format!("PONG :{}", symbol))),
+                #[cfg(never)]
                 EO::ErrorReason(code, msg) => {
                     messages.push((token, format!(":ircd {:03} :{}", code.into_numeric(), msg)))
                 }
+                #[cfg(never)]
                 EO::ErrorNickReason(code, msg) => unimplemented!(),
+                #[cfg(never)]
                 EO::ErrorWordReason(code, word, msg) => unimplemented!(),
                 EO::CloseClient => (),
             }
         }
     }
 
-    fn translate_message<F: FnMut(mio::Token, EO)>(
+    fn translate_message<F: FnMut(mio::Token, Result<Vec<EO>, EOError>)>(
         &mut self,
         token: mio::Token,
         message: Message,
         mut yield_event: F,
     ) -> Result<(), Error> {
         if self.clients.contains_key(&token) {
-            self.translate_client_message(token, message, yield_event)?;
-        } else if let Some(client) = self.translate_pre_auth(token, message, yield_event)? {
-            assert!(
-                self.registering.remove(&token).is_some(),
-                "should be removing a registering client"
-            );
-            assert!(
-                self.clients.insert(token, client).is_none(),
-                "shouldn't be replacing an existing client"
-            );
+            yield_event(token, self.translate_client_message(message)?);
+        } else {
+            match self.translate_pre_auth(token, message)? {
+                PreAuthOp::Waiting => (),
+                PreAuthOp::Complete(client) => {
+                    assert!(
+                        self.registering.remove(&token).is_some(),
+                        "should be removing a registering client"
+                    );
+                    assert!(
+                        self.clients.insert(token, client).is_none(),
+                        "shouldn't be replacing an existing client"
+                    );
+                }
+                PreAuthOp::Event(eo) => yield_event(token, Ok(vec![eo])),
+                PreAuthOp::Error(eo) => yield_event(token, Err(eo)),
+                // TODO: make this actually fatal
+                PreAuthOp::FatalError(eo) => yield_event(token, Err(eo)),
+            }
         }
         Ok(())
     }
 
     /// https://modern.ircdocs.horse/#connection-registration
-    fn translate_pre_auth<F: FnMut(mio::Token, EO)>(
+    fn translate_pre_auth(
         &mut self,
         token: mio::Token,
         message: Message,
-        mut yield_event: F,
-    ) -> Result<Option<Client>, Error> {
+    ) -> Result<PreAuthOp, Error> {
         let mut state = self.registering.entry(token).or_default();
 
         match message.command {
-            Command::CAP(_, cmd, ref arg, _)
-                if CapSubCommand::LS == cmd && *arg == Some("302".to_string()) =>
-            {
-                // We support nothing, hahaha!
-                yield_event(token, reply("CAP * LS :"));
-            }
             Command::PASS(pass) => state.pass = Some(pass),
             Command::NICK(nick) => {
                 if !valid_nick(&nick) {
-                    yield_event(
-                        token,
-                        EO::ErrorNickReason(
-                            ErrorCode::ErroneousNickname,
-                            "invalid nickname; ascii letters, numbers, _. 2-12",
-                        ),
-                    );
-                    return Ok(None);
+                    return Ok(PreAuthOp::Error(EOError::ErrorNickReason(
+                        ErrorCode::ErroneousNickname,
+                        "invalid nickname; ascii letters, numbers, _. 2-12",
+                    )));
                 }
 
                 state.nick = Some(nick);
+
                 if state.ping == PreAuthPing::WaitingForNick {
                     state.ping = PreAuthPing::WaitingForPong;
-                    yield_event(token, raw(format!("PING :{:08x}", state.ping_token.0)));
+                    return Ok(PreAuthOp::Event(EO::Ping(format!(
+                        "{:08x}",
+                        state.ping_token.0
+                    ))));
                 }
             }
             Command::USER(ident, _mode, real_name) => state.gecos = Some((ident, real_name)),
-            Command::PING(arg, _trail) => yield_event(token, EO::Pong(arg)),
+            Command::PING(arg, _trail) => return Ok(PreAuthOp::Event(EO::Pong(arg))),
             Command::PONG(ref arg, _)
                 if PreAuthPing::WaitingForPong == state.ping
                     && u64::from_str_radix(arg, 16) == Ok(state.ping_token.0) =>
@@ -290,28 +308,26 @@ impl System {
             Command::Raw(ref raw, ..) if is_http_verb(raw) => {
                 info!("http command on channel: {:?}", raw);
                 // TODO: is it worth sending them anything?
-                yield_event(token, EO::CloseClient);
+                return Ok(PreAuthOp::Event(EO::CloseClient));
             }
             other => {
-                yield_event(
-                    token,
-                    EO::ErrorReason(ErrorCode::NotRegistered, "invalid pre-auth command"),
-                );
+                return Ok(PreAuthOp::Error(EOError::ErrorReason(
+                    ErrorCode::NotRegistered,
+                    "invalid pre-auth command",
+                )));
             }
         }
 
         if !state.is_client_preamble_done() {
             info!("waiting for more from client...");
-            return Ok(None);
+            return Ok(PreAuthOp::Waiting);
         }
 
         if state.pass.is_none() {
-            yield_event(
-                token,
-                EO::ErrorReason(ErrorCode::PasswordMismatch, "You must provide a password"),
-            );
-            yield_event(token, EO::CloseClient);
-            return Ok(None);
+            return Ok(PreAuthOp::FatalError(EOError::ErrorReason(
+                ErrorCode::PasswordMismatch,
+                "You must provide a password",
+            )));
         }
 
         let nick = state.nick.as_ref().unwrap();
@@ -319,134 +335,74 @@ impl System {
         let account_id = match self.store.user(nick, state.pass.as_ref().unwrap())? {
             Some(id) => id,
             None => {
-                yield_event(
-                    token,
-                    EO::ErrorReason(
-                        ErrorCode::PasswordMismatch,
-                        concat!(
-                            "Incorrect password for account. If you don't know",
-                            " the password, you must use a different nick."
-                        ),
+                return Ok(PreAuthOp::FatalError(EOError::ErrorReason(
+                    ErrorCode::PasswordMismatch,
+                    concat!(
+                        "Incorrect password for account. If you don't know",
+                        " the password, you must use a different nick."
                     ),
-                );
-                yield_event(token, EO::CloseClient);
-                return Ok(None);
+                )));
             }
         };
 
-        // This is all legacy garbage. Trying to get any possible client to continue the connection.
+        send_onboarding(token, nick);
 
-        // Minimal hello.
-
-        yield_event(token, raw(format!(":ircd 001 {} :Hi!", nick)));
-        yield_event(token, raw(format!(":ircd 002 {} :This is IRC.", nick)));
-        yield_event(token, raw(format!(":ircd 003 {} :This server is.", nick)));
-        yield_event(token, raw(format!(":ircd 004 {} ircd badchat iZ s", nick)));
-        yield_event(
-            token,
-            raw(format!(
-                ":ircd 005 {} SAFELIST :are supported by this server",
-                nick
-            )),
-        );
-
-        // Minimal LUSERS
-
-        yield_event(token, raw(format!(":ircd 251 {} :There are users.", nick)));
-        yield_event(
-            token,
-            raw(format!(":ircd 254 {} 69 :channels formed", nick)),
-        );
-        yield_event(
-            token,
-            raw(format!(":ircd 255 {} :I have clients and servers.", nick)),
-        );
-        yield_event(
-            token,
-            raw(format!(
-                ":ircd 265 {} 69 69 :Current local users are nice.",
-                nick
-            )),
-        );
-
-        // Minimal MOTD
-
-        yield_event(
-            token,
-            raw(format!(
-                ":ircd 422 {} :MOTDs haven't been cool for decades.",
-                nick
-            )),
-        );
-
-        yield_event(token, raw(format!(":{} MODE {0} :+iZ", nick)));
-
-        Ok(Some(Client {
+        Ok(PreAuthOp::Complete(Client {
             account_id,
             nick: nick.to_string(),
             channels: HashSet::new(),
         }))
     }
 
-    fn translate_client_message<F: FnMut(mio::Token, EO)>(
+    fn translate_client_message(
         &mut self,
-        token: mio::Token,
         message: Message,
-        mut yield_event: F,
-    ) -> Result<(), Error> {
-        match message.command {
+    ) -> Result<Result<Vec<EO>, EOError>, Error> {
+        Ok(match message.command {
             Command::JOIN(ref chan, ref keys, ref real_name)
                 if keys.is_none() && real_name.is_none() =>
             {
+                let mut joins = Vec::with_capacity(4);
                 for chan in chan.split(',') {
                     let chan: &str = chan.trim();
                     if valid_channel(chan) {
-                        yield_event(token, EO::JoinChannel(self.store.load_channel(chan)?))
+                        joins.push(EO::JoinChannel(self.store.load_channel(chan)?))
                     } else {
-                        yield_event(
-                            token,
-                            EO::ErrorWordReason(
-                                ErrorCode::InvalidChannel,
-                                "*".to_string(),
-                                "channel name invalid",
-                            ),
-                        )
+                        return Ok(Err(EOError::ErrorWordReason(
+                            ErrorCode::InvalidChannel,
+                            "*".to_string(),
+                            "channel name invalid",
+                        )));
                     }
                 }
+                Ok(joins)
             }
             Command::PRIVMSG(dest, msg) => {
                 if dest.starts_with('#') && valid_channel(&dest) {
-                    yield_event(
-                        token,
-                        EO::MessageChannel(self.store.load_channel(&dest)?, msg),
-                    )
+                    Ok(vec![EO::MessageChannel(
+                        self.store.load_channel(&dest)?,
+                        msg,
+                    )])
                 } else if valid_nick(&dest) {
-                    yield_event(token, EO::MessageIndividual(dest, msg))
+                    Ok(vec![EO::MessageIndividual(dest, msg)])
                 } else {
-                    yield_event(
-                        token,
-                        EO::ErrorWordReason(
-                            ErrorCode::NoSuchNick,
-                            "*".to_string(),
-                            "invalid channel or nickname",
-                        ),
-                    )
+                    Err(EOError::ErrorWordReason(
+                        ErrorCode::NoSuchNick,
+                        "*".to_string(),
+                        "invalid channel or nickname",
+                    ))
                 }
             }
-            Command::PING(arg, _) => yield_event(token, EO::Pong(arg)),
-            Command::PONG(..) => (),
+            Command::PING(arg, _) => Ok(vec![EO::Pong(arg)]),
+            Command::PONG(..) => Ok(vec![]),
             other => {
                 info!("invalid command: {:?}", other);
-                yield_event(
-                    token,
-                    EO::ErrorNickReason(
-                        ErrorCode::UnknownCommand,
-                        "unrecognised or mis-parsed command",
-                    ),
-                );
+                Err(EOError::ErrorNickReason(
+                    ErrorCode::UnknownCommand,
+                    "unrecognised or mis-parsed command",
+                ))
             }
-        }
-        Ok(())
+        })
     }
 
     fn message_channel(&self, id: ChannelId) {
@@ -532,6 +488,53 @@ fn take_messages<F: FnMut(irc_proto::Message)>(
     }
 
     Ok(())
+}
+
+fn send_onboarding(token: mio::Token, nick: &String) {
+    fn yield_event<T>(token: mio::Token, msg: T) {
+        unimplemented!()
+    }
+
+    // This is all legacy garbage. Trying to get any possible client to continue the connection.
+
+    // Minimal hello.
+    yield_event(token, raw(format!(":ircd 001 {} :Hi!", nick)));
+    yield_event(token, raw(format!(":ircd 002 {} :This is IRC.", nick)));
+    yield_event(token, raw(format!(":ircd 003 {} :This server is.", nick)));
+    yield_event(token, raw(format!(":ircd 004 {} ircd badchat iZ s", nick)));
+    yield_event(
+        token,
+        raw(format!(
+            ":ircd 005 {} SAFELIST :are supported by this server",
+            nick
+        )),
+    );
+    // Minimal LUSERS
+    yield_event(token, raw(format!(":ircd 251 {} :There are users.", nick)));
+    yield_event(
+        token,
+        raw(format!(":ircd 254 {} 69 :channels formed", nick)),
+    );
+    yield_event(
+        token,
+        raw(format!(":ircd 255 {} :I have clients and servers.", nick)),
+    );
+    yield_event(
+        token,
+        raw(format!(
+            ":ircd 265 {} 69 69 :Current local users are nice.",
+            nick
+        )),
+    );
+    // Minimal MOTD
+    yield_event(
+        token,
+        raw(format!(
+            ":ircd 422 {} :MOTDs haven't been cool for decades.",
+            nick
+        )),
+    );
+    yield_event(token, raw(format!(":{} MODE {0} :+iZ", nick)));
 }
 
 fn line_to_message(
