@@ -196,7 +196,7 @@ impl System {
         let mut output = Vec::with_capacity(messages.len());
 
         for (token, message) in messages {
-            match self.translate_message(token, message).expect("TODO") {
+            match self.translate_message(token, message) {
                 Ok(events) => {
                     for event in events {
                         match self.translate_event(token, event).expect("TODO") {
@@ -220,11 +220,11 @@ impl System {
         &mut self,
         token: mio::Token,
         message: Message,
-    ) -> Result<Result<Vec<EO>, EOError>, Error> {
+    ) -> Result<Vec<EO>, EOError> {
         if self.clients.contains_key(&token) {
             self.translate_client_message(message)
         } else {
-            Ok(match self.translate_pre_auth(token, message)? {
+            match self.translate_pre_auth(token, message)? {
                 PreAuthOp::Waiting => Ok(vec![]),
                 PreAuthOp::Complete(client) => {
                     assert!(
@@ -241,7 +241,7 @@ impl System {
                 PreAuthOp::Error(eo) => Err(eo),
                 // TODO: make this actually fatal
                 PreAuthOp::FatalError(eo) => Err(eo),
-            })
+            }
         }
     }
 
@@ -380,8 +380,8 @@ impl System {
     fn translate_client_message(
         &mut self,
         message: Message,
-    ) -> Result<Result<Vec<EO>, EOError>, Error> {
-        Ok(match message.command {
+    ) -> Result<Vec<EO>, EOError> {
+        match message.command {
             Command::JOIN(ref chan, ref keys, ref real_name)
                 if keys.is_none() && real_name.is_none() =>
             {
@@ -391,11 +391,11 @@ impl System {
                     if valid_channel(chan) {
                         joins.push(EO::JoinChannel(self.store.load_channel(chan)))
                     } else {
-                        return Ok(Err(EOError::ErrorWordReason(
+                        return Err(EOError::ErrorWordReason(
                             ErrorCode::InvalidChannel,
                             "*".to_string(),
                             "channel name invalid",
-                        )));
+                        ));
                     }
                 }
                 Ok(joins)
@@ -425,7 +425,7 @@ impl System {
                     "unrecognised or mis-parsed command",
                 ))
             }
-        })
+        }
     }
 
     fn message_channel(&self, id: ChannelId) {
