@@ -28,7 +28,7 @@ impl Store {
 
     pub fn user(&mut self, nick: &str, pass: &str) -> Result<Option<i64>, Error> {
         // committed inside `create_user`, not sure I like that?
-        let mut tx = self.conn.transaction()?;
+        let tx = self.conn.transaction()?;
 
         let account_id = match load_id(&tx, "select account_id from nick where nick=?", &[nick])? {
             Some(val) => val,
