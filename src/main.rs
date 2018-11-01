@@ -193,63 +193,39 @@ impl System {
             }
         }
 
-        let mut events = Vec::with_capacity(messages.len());
+        let mut output = Vec::with_capacity(messages.len());
 
         for (token, message) in messages {
-            self.translate_message(token, message, |token, event| events.push((token, event)))
-                .expect("TODO");
+            match self.translate_message(token, message).expect("TODO") {
+                Ok(events) => {
+                    for event in events {
+                        match self.translate_event(token, event).expect("TODO") {
+                            Ok(lines) => output.extend(lines),
+                            Err(e) => self.send_error(e),
+                        }
+                    }
+                }
+                Err(e) => self.send_error(e),
+            }
         }
 
-        let mut messages = Vec::with_capacity(events.len());
-
-        // update clients and generate messages
-        for (token, event) in events {
-            let client = match self.clients.get_mut(&token) {
-                Some(client) => client,
-                None => continue,
-            };
-
-            // TODO: list/error is a mess here
-            match event.unwrap().into_iter().next().unwrap() {
-                EO::JoinChannel(channel) => self.joined(
-                    token,
-                    unimplemented!(),
-                    |_, _| unimplemented!(),
-                    unimplemented!(),
-                    unimplemented!(),
-                ),
-                EO::SendMessage(msg) => messages.push((token, msg)),
-                EO::MessageIndividual(other_nick, msg) => messages.push((
-                    token,
-                    format!("{}!~@irc PRIVMSG {} :{}", client.nick, other_nick, msg),
-                )),
-                EO::MessageChannel(channel, _msg) => self.message_channel(channel),
-                EO::Ping(symbol) => messages.push((token, format!("PING :{}", symbol))),
-                EO::Pong(symbol) => messages.push((token, format!("PONG :{}", symbol))),
-                #[cfg(never)]
-                EO::ErrorReason(code, msg) => {
-                    messages.push((token, format!(":ircd {:03} :{}", code.into_numeric(), msg)))
-                }
-                #[cfg(never)]
-                EO::ErrorNickReason(code, msg) => unimplemented!(),
-                #[cfg(never)]
-                EO::ErrorWordReason(code, word, msg) => unimplemented!(),
-                EO::CloseClient => (),
+        for (token, line) in output {
+            if let Some(mut conn) = connections.get_mut(&token) {
+                conn.write_line(line).expect("TODO")
             }
         }
     }
 
-    fn translate_message<F: FnMut(mio::Token, Result<Vec<EO>, EOError>)>(
+    fn translate_message(
         &mut self,
         token: mio::Token,
         message: Message,
-        mut yield_event: F,
-    ) -> Result<(), Error> {
+    ) -> Result<Result<Vec<EO>, EOError>, Error> {
         if self.clients.contains_key(&token) {
-            yield_event(token, self.translate_client_message(message)?);
+            self.translate_client_message(message)
         } else {
-            match self.translate_pre_auth(token, message)? {
-                PreAuthOp::Waiting => (),
+            Ok(match self.translate_pre_auth(token, message)? {
+                PreAuthOp::Waiting => Ok(vec![]),
                 PreAuthOp::Complete(client) => {
                     assert!(
                         self.registering.remove(&token).is_some(),
@@ -259,14 +235,61 @@ impl System {
                         self.clients.insert(token, client).is_none(),
                         "shouldn't be replacing an existing client"
                     );
+                    Ok(Vec::new())
                 }
-                PreAuthOp::Event(eo) => yield_event(token, Ok(vec![eo])),
-                PreAuthOp::Error(eo) => yield_event(token, Err(eo)),
+                PreAuthOp::Event(eo) => Ok(vec![eo]),
+                PreAuthOp::Error(eo) => Err(eo),
                 // TODO: make this actually fatal
-                PreAuthOp::FatalError(eo) => yield_event(token, Err(eo)),
-            }
+                PreAuthOp::FatalError(eo) => Err(eo),
+            })
         }
-        Ok(())
+    }
+
+    fn translate_event(
+        &mut self,
+        token: mio::Token,
+        event: EO,
+    ) -> Result<Result<Vec<(mio::Token, String)>, EOError>, Error> {
+        let mut output = Vec::with_capacity(4);
+
+        let client = match self.clients.get_mut(&token) {
+            Some(client) => client,
+            None => bail!("invalid client"),
+        };
+
+        match event {
+            EO::JoinChannel(channel) => self.joined(
+                token,
+                unimplemented!(),
+                |_, _| unimplemented!(),
+                unimplemented!(),
+                unimplemented!(),
+            ),
+            EO::SendMessage(msg) => output.push((token, msg)),
+            EO::MessageIndividual(other_nick, msg) => output.push((
+                token,
+                format!("{}!~@irc PRIVMSG {} :{}", client.nick, other_nick, msg),
+            )),
+            EO::MessageChannel(channel, _msg) => self.message_channel(channel),
+            EO::Ping(symbol) => output.push((token, format!("PING :{}", symbol))),
+            EO::Pong(symbol) => output.push((token, format!("PONG :{}", symbol))),
+            EO::CloseClient => unimplemented!(),
+        }
+
+        Ok(Ok(output))
+    }
+
+    fn send_error(&mut self, err: EOError) {
+        #[cfg(never)]
+        match err {
+            EO::ErrorReason(code, msg) => {
+                output.push((token, format!(":ircd {:03} :{}", code.into_numeric(), msg)))
+            }
+            EO::ErrorNickReason(code, msg) => unimplemented!(),
+            EO::ErrorWordReason(code, word, msg) => unimplemented!(),
+        }
+
+        unimplemented!()
     }
 
     /// https://modern.ircdocs.horse/#connection-registration
@@ -632,10 +655,6 @@ fn valid_nick(nick: &str) -> bool {
 
 fn valid_nick_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || "_".contains(c)
-}
-
-fn reply<S: fmt::Display>(whole: S) -> EO {
-    EO::SendMessage(format!(":ircd {}", whole))
 }
 
 fn raw<S: ToString>(whole: S) -> EO {
