@@ -210,7 +210,10 @@ impl System {
 
         for (token, line) in output {
             if let Some(mut conn) = connections.get_mut(&token) {
-                conn.write_line(line).expect("TODO")
+                if let Err(e) = conn.write_line(line) {
+                    info!("{:?}: error sending normal message: {:?}", token, e);
+                    conn.start_closing();
+                }
             }
         }
     }

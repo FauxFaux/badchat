@@ -219,8 +219,10 @@ impl Connection {
     }
 
     pub fn start_closing(&mut self) {
-        self.tls_session.send_close_notify();
-        self.closing = true;
+        if !self.closing {
+            self.tls_session.send_close_notify();
+            self.closing = true;
+        }
     }
 
     pub fn write_line<S: AsRef<str>>(&mut self, val: S) -> Result<(), Error> {
