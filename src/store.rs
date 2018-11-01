@@ -1,3 +1,4 @@
+use std::fmt;
 use std::time;
 
 use cast::i64;
@@ -26,106 +27,109 @@ impl Store {
         })
     }
 
-    pub fn user(&mut self, nick: &str, pass: &str) -> Result<Option<i64>, Error> {
+    pub fn user(&mut self, nick: &str, pass: &str) -> Option<i64> {
         // committed inside `create_user`, not sure I like that?
-        let tx = self.conn.transaction()?;
+        let tx = self.conn.transaction().unwrap_system();
 
-        let account_id = match load_id(&tx, "select account_id from nick where nick=?", &[nick])? {
+        let account_id = match load_id(&tx, "select account_id from nick where nick=?", &[nick]) {
             Some(val) => val,
             None => {
-                let user = create_user(tx, nick, pass)?;
-                return Ok(Some(user));
+                let user = create_user(tx, nick, pass);
+                return Some(user);
             }
         };
 
         for hashed in tx
-            .prepare_cached("select pass from account_pass where account_id=?")?
-            .query_map(&[account_id], |row| row.get::<_, String>(0))?
+            .prepare_cached("select pass from account_pass where account_id=?").unwrap_system()
+            .query_map(&[account_id], |row| row.get::<_, String>(0)).unwrap_system()
         {
-            let hashed = hashed?;
-            if check_pass(pass, &hashed)? {
-                return Ok(Some(account_id));
+            let hashed = hashed.unwrap_system();
+            if check_pass(pass, &hashed) {
+                return Some(account_id);
             }
         }
 
-        return Ok(None);
+        None
     }
 
-    pub fn load_channel(&mut self, name: &str) -> Result<ChannelId, Error> {
-        let tx = self.conn.transaction()?;
-        Ok(ChannelId(
-            match load_id(&tx, "select id from channel where name=?", &[name])? {
+    pub fn load_channel(&mut self, name: &str) -> ChannelId {
+        let tx = self.conn.transaction().unwrap_system();
+        ChannelId(
+            match load_id(&tx, "select id from channel where name=?", &[name]) {
                 Some(id) => id,
-                None => create_channel(tx, name)?,
+                None => create_channel(tx, name),
             },
-        ))
+        )
     }
 }
 
-fn load_id<P>(tx: &Transaction, query: &'static str, params: P) -> Result<Option<i64>, Error>
+fn load_id<P>(tx: &Transaction, query: &'static str, params: P) -> Option<i64>
 where
     P: IntoIterator,
     P::Item: ToSql,
 {
-    let mut stat = tx.prepare_cached(query)?;
-    let mut query = stat.query_map(params, |row| row.get::<_, i64>(0))?;
-    Ok(if let Some(res) = query.next() {
-        ensure!(query.next().is_none(), "unexpected multiple rows");
-        Some(res?)
+    let mut stat = tx.prepare_cached(query).unwrap_system();
+    let mut query = stat.query_map(params, |row| row.get::<_, i64>(0)).unwrap_system();
+    if let Some(res) = query.next() {
+        assert!(query.next().is_none(), "unexpected multiple rows");
+        Some(res.unwrap_system())
     } else {
         None
-    })
+    }
 }
 
-fn create_user(tx: Transaction, nick: &str, pass: &str) -> Result<i64, Error> {
+fn create_user(tx: Transaction, nick: &str, pass: &str) -> i64 {
     let now = unix_time();
 
-    tx.execute("insert into account (creation_time) values (?)", &[now])?;
+    tx.execute("insert into account (creation_time) values (?)", &[now]).unwrap_system();
 
     let account_id = tx.last_insert_rowid();
 
     tx.execute(
         "insert into nick (nick, account_id) values (?,?)",
         &[&nick as &ToSql, &account_id],
-    )?;
+    ).unwrap_system();
 
     tx.execute(
         "insert into account_pass (account_id, pass) values (?,?)",
         &[
             &account_id as &ToSql,
-            &pbkdf2_simple(pass, PBKDF2_ITERATION_COUNT)?,
+            &pbkdf2_simple(pass, PBKDF2_ITERATION_COUNT).unwrap_system(),
         ],
-    )?;
+    ).unwrap_system();
 
-    tx.commit()?;
+    tx.commit().unwrap_system();
 
     info!("created user {:?}", nick);
 
-    Ok(account_id)
+    account_id
 }
 
-fn create_channel(tx: Transaction, name: &str) -> Result<i64, Error> {
+fn create_channel(tx: Transaction, name: &str) -> i64 {
     let now = unix_time();
 
     tx.execute(
         "insert into channel (name, creation_time, mode) values (?,?,?)",
         &[&name as &ToSql, &now, &""],
-    )?;
+    ).unwrap_system();
 
     let channel_id = tx.last_insert_rowid();
 
-    tx.commit()?;
+    tx.commit().unwrap_system();
 
-    info!("created channel {:?}", name);
+    info!("created channel {:?}: {}", name, channel_id);
 
-    Ok(channel_id)
+    channel_id
 }
 
-fn check_pass(pass: &str, hashed: &str) -> Result<bool, Error> {
+fn check_pass(pass: &str, hashed: &str) -> bool {
     match pbkdf2_check(pass, hashed) {
-        Ok(()) => Ok(true),
-        Err(CheckError::HashMismatch) => Ok(false),
-        Err(e) => bail!(e),
+        Ok(()) => true,
+        Err(CheckError::HashMismatch) => false,
+        Err(e) => {
+            error!("pass parsing failed: {:?}", hashed);
+            false
+        },
     }
 }
 
@@ -135,4 +139,16 @@ fn unix_time() -> i64 {
         .unwrap()
         .as_secs())
     .expect("current time out of range")
+}
+
+trait SystemError<T, E> {
+    /// unwrap, but this is expected if there's a problem with the system,
+    /// but not e.g. user input errors
+    fn unwrap_system(self) -> T;
+}
+
+impl<T, E: fmt::Debug> SystemError<T, E> for Result<T, E> {
+    fn unwrap_system(self) -> T {
+        self.unwrap()
+    }
 }

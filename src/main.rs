@@ -355,7 +355,7 @@ impl System {
 
         let nick = state.nick.as_ref().unwrap();
 
-        let account_id = match self.store.user(nick, state.pass.as_ref().unwrap())? {
+        let account_id = match self.store.user(nick, state.pass.as_ref().unwrap()) {
             Some(id) => id,
             None => {
                 return Ok(PreAuthOp::FatalError(EOError::ErrorReason(
@@ -389,7 +389,7 @@ impl System {
                 for chan in chan.split(',') {
                     let chan: &str = chan.trim();
                     if valid_channel(chan) {
-                        joins.push(EO::JoinChannel(self.store.load_channel(chan)?))
+                        joins.push(EO::JoinChannel(self.store.load_channel(chan)))
                     } else {
                         return Ok(Err(EOError::ErrorWordReason(
                             ErrorCode::InvalidChannel,
@@ -403,7 +403,7 @@ impl System {
             Command::PRIVMSG(dest, msg) => {
                 if dest.starts_with('#') && valid_channel(&dest) {
                     Ok(vec![EO::MessageChannel(
-                        self.store.load_channel(&dest)?,
+                        self.store.load_channel(&dest),
                         msg,
                     )])
                 } else if valid_nick(&dest) {
