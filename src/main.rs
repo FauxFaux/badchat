@@ -185,9 +185,9 @@ impl System {
             let message = match message {
                 Ok(message) => message,
                 Err(e) => {
-                    self.send_error(e);
+                    output.push(self.render_error(e, token));
                     continue;
-                },
+                }
             };
 
             match self.translate_message(token, message) {
@@ -195,11 +195,11 @@ impl System {
                     for event in events {
                         match self.translate_event(token, event) {
                             Ok(lines) => output.extend(lines),
-                            Err(e) => self.send_error(e),
+                            Err(e) => output.push(self.render_error(e, token)),
                         }
                     }
                 }
-                Err(e) => self.send_error(e),
+                Err(e) => output.push(self.render_error(e, token)),
             }
         }
 
@@ -278,17 +278,26 @@ impl System {
         Ok(output)
     }
 
-    fn send_error(&mut self, err: ClientError) {
-        #[cfg(never)]
-        match err {
-            Req::ErrorReason(code, msg) => {
-                output.push((token, format!(":ircd {:03} :{}", code.into_numeric(), msg)))
-            }
-            Req::ErrorNickReason(code, msg) => unimplemented!(),
-            Req::ErrorWordReason(code, word, msg) => unimplemented!(),
-        }
-
-        unimplemented!()
+    fn render_error(&self, err: ClientError, us: mio::Token) -> (mio::Token, String) {
+        (
+            us,
+            match err {
+                ClientError::ErrorReason(code, msg) => {
+                    format!(":ircd {:03} :{}", code.into_numeric(), msg)
+                }
+                ClientError::ErrorNickReason(code, msg) => {
+                    let nick = self
+                        .clients
+                        .get(&us)
+                        .map(|client| client.nick.as_str())
+                        .unwrap_or("*");
+                    format!(":ircd {:03} {} :{}", code.into_numeric(), nick, msg)
+                }
+                ClientError::ErrorWordReason(code, word, msg) => {
+                    format!(":ircd {:03} {} :{}", code.into_numeric(), word, msg)
+                }
+            },
+        )
     }
 
     /// https://modern.ircdocs.horse/#connection-registration
@@ -521,9 +530,7 @@ impl System {
     }
 }
 
-fn take_messages(
-    conn: &mut serv::Connection,
-) -> Vec<Result<irc_proto::Message, ClientError>> {
+fn take_messages(conn: &mut serv::Connection) -> Vec<Result<irc_proto::Message, ClientError>> {
     if conn.broken_input {
         match pop_line(&mut conn.input_buffer) {
             PoppedLine::Done(_) | PoppedLine::TooLong => {
@@ -546,7 +553,10 @@ fn take_messages(
     }
 
     if conn.input_buffer.len() > 10 * INPUT_LENGTH_LIMIT {
-        output.push(Err(ClientError::ErrorReason(ErrorCode::LineTooLong, "Your input buffer is full.")));
+        output.push(Err(ClientError::ErrorReason(
+            ErrorCode::LineTooLong,
+            "Your input buffer is full.",
+        )));
 
         conn.broken_input = true;
         conn.input_buffer.clear();
@@ -598,20 +608,29 @@ fn line_to_message(
         PoppedLine::Done(line) => line,
         PoppedLine::NotReady => return Ok(None),
         PoppedLine::TooLong => {
-            return Err(ClientError::ErrorReason( ErrorCode::LineTooLong, "Your message was discarded as it was too long"));
+            return Err(ClientError::ErrorReason(
+                ErrorCode::LineTooLong,
+                "Your message was discarded as it was too long",
+            ));
         }
     };
 
     let line = String::from_utf8(line).map_err(|parse_error| {
         debug!("{:?}: {:?}", token, parse_error);
-        ClientError::ErrorReason( ErrorCode::BadCharEncoding, "Your line was discarded as it was not encoded using 'utf-8'")
+        ClientError::ErrorReason(
+            ErrorCode::BadCharEncoding,
+            "Your line was discarded as it was not encoded using 'utf-8'",
+        )
     })?;
 
     trace!("{:?}: line: {:?}", token, line);
 
     Ok(Some(line.parse().map_err(|parse_error| {
         debug!("{:?}: bad command: {:?} {:?}", token, line, parse_error);
-        ClientError::ErrorReason(  ErrorCode::UnknownError, "Unable to parse your input as any form of message")
+        ClientError::ErrorReason(
+            ErrorCode::UnknownError,
+            "Unable to parse your input as any form of message",
+        )
     })?))
 }
 
