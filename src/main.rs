@@ -264,13 +264,7 @@ impl System {
                     .into_iter()
                     .map(|line| (token, line)),
             ),
-            Req::JoinChannel(channel) => self.joined(
-                token,
-                unimplemented!(),
-                |_, _| unimplemented!(),
-                unimplemented!(),
-                unimplemented!(),
-            ),
+            Req::JoinChannel(ref channel) => output.extend(self.joined(token, channel)),
             Req::MessageIndividual(other_nick, msg) => output.push((
                 token,
                 format!("{}!~@irc PRIVMSG {} :{}", nick, other_nick, msg),
@@ -450,44 +444,82 @@ impl System {
         output
     }
 
-    fn joined<F: FnMut(mio::Token, Req)>(
-        &mut self,
-        token: mio::Token,
-        client: &Client,
-        mut yield_event: F,
-        chan: &String,
-        id: &ChannelId,
-    ) {
+    fn joined(&mut self, us: mio::Token, chan: &String) -> Vec<(mio::Token, String)> {
+        let mut output = Vec::with_capacity(32);
+        let id = self.store.load_channel(chan);
+
+        let nick = {
+            let client = self
+                .clients
+                .get_mut(&us)
+                .expect("client generating event should exist");
+            if !client.channels.insert(id) {
+                return Vec::new();
+            }
+            client.nick.to_string()
+        };
+
         // client joins, 322 topic, 333 topic who/time, 353 users, 366 end of names
-        yield_event(token, raw(format!(":{}!~@irc JOIN {}", client.nick, chan)));
-        yield_event(
-            token,
-            raw(format!(
+
+        // send everyone the join message
+        for (other_token, other_client) in &self.clients {
+            if !other_client.channels.contains(&id) {
+                continue;
+            }
+            output.push((*other_token, format!(":{}!~@irc JOIN {}", nick, chan)));
+        }
+
+        // send us some details
+        output.push((
+            us,
+            format!(
                 ":ircd 332 {} {} :This topic intentionally left blank.",
-                client.nick, chan
-            )),
-        );
+                nick, chan
+            ),
+        ));
         // @: secret channel (+s)
         // TODO: client modes in a channel
-        // TODO: splitting into multiple lines
-        let names = self
+
+        const WRAP_AT: usize = 400;
+        let mut blocks = Vec::with_capacity(8);
+        let mut block = String::with_capacity(WRAP_AT + 32);
+        for name in self
             .clients
             .values()
             .filter(|client| client.channels.contains(&id))
             .map(|client| client.nick.as_ref())
-            .collect::<Vec<&str>>()
-            .join(" ");
-        yield_event(
-            token,
-            raw(format!(
-                ":ircd 353 {} @ {} :{} {}",
-                client.nick, chan, client.nick, names
-            )),
-        );
-        yield_event(
-            token,
-            raw(format!(":ircd 366 {} {} :</names>", client.nick, chan)),
-        );
+        {
+            block.push_str(name);
+
+            if block.len() > WRAP_AT {
+                blocks.push(block.to_string());
+                block.clear();
+            }
+
+            block.push(' ');
+        }
+
+        if let Some(val) = block.pop() {
+            assert_eq!(
+                ' ', val,
+                "if the block has an end, it should end in a space"
+            );
+        }
+
+        if !block.is_empty() {
+            blocks.push(block);
+        }
+
+        for names in blocks {
+            output.push((
+                us,
+                format!(":ircd 353 {} @ {} :{} {}", nick, chan, nick, names),
+            ));
+        }
+
+        output.push((us, format!(":ircd 366 {} {} :</names>", nick, chan)));
+
+        output
     }
 }
 
