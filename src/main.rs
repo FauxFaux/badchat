@@ -134,7 +134,6 @@ impl ErrorCode {
 
 #[derive(Debug)]
 enum Req {
-    OnBoard,
     JoinChannel(String),
     MessageChannel(String, String),
     MessageIndividual(String, String),
@@ -145,6 +144,7 @@ enum Req {
 
 #[derive(Debug, Copy, Clone)]
 enum ClientError {
+    Die,
     ErrorReason(ErrorCode, &'static str),
     ErrorNickReason(ErrorCode, &'static str),
     ErrorWordReason(ErrorCode, &'static str, &'static str),
@@ -153,8 +153,11 @@ enum ClientError {
 enum PreAuthOp {
     Waiting,
     Complete(Client),
-    Request(Req),
+    Ping(String),
+    Pong(String),
     Error(ClientError),
+
+    /// Mmm, no. We should extend ClientError with a proper ::Die.
     FatalError(ClientError),
 }
 
@@ -190,16 +193,48 @@ impl System {
                 }
             };
 
-            match self.translate_message(token, message) {
-                Ok(events) => {
-                    for event in events {
-                        match self.translate_event(token, event) {
-                            Ok(lines) => output.extend(lines),
-                            Err(e) => output.push(self.render_error(e, token)),
+            // I don't like this nested error handling. None of the collect() stuff works 'cos we
+            // want to maintain order, and process everything. The main purpose was to simplify
+            // translate_event, which hasn't happened. Maybe nest into the `Req`?
+
+            if self.clients.contains_key(&token) {
+                match self.translate_client_message(message) {
+                    Ok(events) => {
+                        for event in events {
+                            match self.translate_event(token, event) {
+                                Ok(lines) => output.extend(lines),
+                                Err(e) => output.push(self.render_error(e, token)),
+                            }
                         }
                     }
+                    Err(e) => output.push(self.render_error(e, token)),
                 }
-                Err(e) => output.push(self.render_error(e, token)),
+            } else {
+                match self.translate_pre_auth(token, message) {
+                    PreAuthOp::Waiting => (),
+                    PreAuthOp::Complete(client) => {
+                        output.extend(
+                            send_on_boarding(&client.nick)
+                                .into_iter()
+                                .map(|line| (token, line)),
+                        );
+                        assert!(
+                            self.registering.remove(&token).is_some(),
+                            "should be removing a registering client"
+                        );
+                        assert!(
+                            self.clients.insert(token, client).is_none(),
+                            "shouldn't be replacing an existing client"
+                        );
+                    }
+                    PreAuthOp::Ping(ref label) => output.push((token, render_ping(label))),
+                    PreAuthOp::Pong(ref label) => output.push((token, render_pong(label))),
+                    PreAuthOp::Error(eo) => output.push(self.render_error(eo, token)),
+                    PreAuthOp::FatalError(eo) => {
+                        output.push(self.render_error(eo, token));
+                        output.push(unimplemented!("die"))
+                    }
+                }
             }
         }
 
@@ -209,35 +244,6 @@ impl System {
                     info!("{:?}: error sending normal message: {:?}", token, e);
                     conn.start_closing();
                 }
-            }
-        }
-    }
-
-    fn translate_message(
-        &mut self,
-        token: mio::Token,
-        message: Message,
-    ) -> Result<Vec<Req>, ClientError> {
-        if self.clients.contains_key(&token) {
-            self.translate_client_message(message)
-        } else {
-            match self.translate_pre_auth(token, message) {
-                PreAuthOp::Waiting => Ok(vec![]),
-                PreAuthOp::Complete(client) => {
-                    assert!(
-                        self.registering.remove(&token).is_some(),
-                        "should be removing a registering client"
-                    );
-                    assert!(
-                        self.clients.insert(token, client).is_none(),
-                        "shouldn't be replacing an existing client"
-                    );
-                    Ok(vec![Req::OnBoard])
-                }
-                PreAuthOp::Request(req) => Ok(vec![req]),
-                PreAuthOp::Error(eo) => Err(eo),
-                // TODO: make this actually fatal
-                PreAuthOp::FatalError(eo) => Err(eo),
             }
         }
     }
@@ -257,11 +263,6 @@ impl System {
             .to_string();
 
         match event {
-            Req::OnBoard => output.extend(
-                send_on_boarding(&nick)
-                    .into_iter()
-                    .map(|line| (token, line)),
-            ),
             Req::JoinChannel(ref channel) => output.extend(self.joined(token, channel)),
             Req::MessageIndividual(other_nick, msg) => output.push((
                 token,
@@ -270,8 +271,8 @@ impl System {
             Req::MessageChannel(ref channel, ref msg) => {
                 output.extend(self.message_channel(token, &nick, channel, msg))
             }
-            Req::Ping(symbol) => output.push((token, format!("PING :{}", symbol))),
-            Req::Pong(symbol) => output.push((token, format!("PONG :{}", symbol))),
+            Req::Ping(ref symbol) => output.push((token, render_ping(symbol))),
+            Req::Pong(ref symbol) => output.push((token, render_pong(symbol))),
             Req::CloseClient => unimplemented!(),
         }
 
@@ -282,6 +283,7 @@ impl System {
         (
             us,
             match err {
+                ClientError::Die => unimplemented!("die"),
                 ClientError::ErrorReason(code, msg) => {
                     format!(":ircd {:03} :{}", code.into_numeric(), msg)
                 }
@@ -318,11 +320,11 @@ impl System {
 
                 if state.ping == PreAuthPing::WaitingForNick {
                     state.ping = PreAuthPing::WaitingForPong;
-                    return PreAuthOp::Request(Req::Ping(format!("{:08x}", state.ping_token.0)));
+                    return PreAuthOp::Ping(format!("{:08x}", state.ping_token.0));
                 }
             }
             Command::USER(ident, _mode, real_name) => state.gecos = Some((ident, real_name)),
-            Command::PING(arg, _trail) => return PreAuthOp::Request(Req::Pong(arg)),
+            Command::PING(arg, _trail) => return PreAuthOp::Pong(arg),
             Command::PONG(ref arg, _)
                 if PreAuthPing::WaitingForPong == state.ping
                     && u64::from_str_radix(arg, 16) == Ok(state.ping_token.0) =>
@@ -332,7 +334,7 @@ impl System {
             Command::Raw(ref raw, ..) if is_http_verb(raw) => {
                 info!("http command on channel: {:?}", raw);
                 // TODO: is it worth sending them anything?
-                return PreAuthOp::Request(Req::CloseClient);
+                return PreAuthOp::Error(ClientError::Die);
             }
             other => {
                 return PreAuthOp::Error(ClientError::ErrorReason(
@@ -563,6 +565,14 @@ fn take_messages(conn: &mut serv::Connection) -> Vec<Result<irc_proto::Message, 
     }
 
     output
+}
+
+fn render_ping(label: &str) -> String {
+    format!("PING :{}", label)
+}
+
+fn render_pong(label: &str) -> String {
+    format!("PONG :{}", label)
 }
 
 fn send_on_boarding<D: fmt::Display>(nick: D) -> Vec<String> {
