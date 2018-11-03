@@ -220,23 +220,7 @@ impl System {
             } else {
                 match self.translate_pre_auth(token, message) {
                     PreAuthOp::Waiting => vec![],
-                    PreAuthOp::Complete(client) => {
-                        let on_boarding = send_on_boarding(&client.nick)
-                            .into_iter()
-                            .map(|line| o(token, line))
-                            .collect();
-
-                        assert!(
-                            self.registering.remove(&token).is_some(),
-                            "should be removing a registering client"
-                        );
-                        assert!(
-                            self.clients.insert(token, client).is_none(),
-                            "shouldn't be replacing an existing client"
-                        );
-
-                        on_boarding
-                    }
+                    PreAuthOp::Complete(client) => self.on_board(token, client),
                     PreAuthOp::Ping(ref label) => vec![o(token, render_ping(label))],
                     PreAuthOp::Pong(ref label) => vec![o(token, render_pong(label))],
                     PreAuthOp::Error(eo) => vec![self.render_error(eo, token)],
@@ -477,6 +461,24 @@ impl System {
         }
 
         output
+    }
+
+    fn on_board(&mut self, token: mio::Token, client: Client) -> Vec<Output> {
+        let on_boarding = send_on_boarding(&client.nick)
+            .into_iter()
+            .map(|line| o(token, line))
+            .collect();
+
+        assert!(
+            self.registering.remove(&token).is_some(),
+            "should be removing a registering client"
+        );
+        assert!(
+            self.clients.insert(token, client).is_none(),
+            "shouldn't be replacing an existing client"
+        );
+
+        on_boarding
     }
 
     fn joined(&mut self, us: mio::Token, chan: &String) -> Vec<Output> {
