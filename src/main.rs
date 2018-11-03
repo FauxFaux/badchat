@@ -139,7 +139,6 @@ enum Req {
     MessageIndividual(String, String),
     Ping(String),
     Pong(String),
-    CloseClient,
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -159,6 +158,22 @@ enum PreAuthOp {
 
     /// Mmm, no. We should extend ClientError with a proper ::Die.
     FatalError(ClientError),
+}
+
+struct Output {
+    token: mio::Token,
+    line: String,
+
+    /// Mmm. Trying to simplify 99% of the code which doesn't care.
+    then_close: bool,
+}
+
+fn o<S: ToString>(token: mio::Token, message: S) -> Output {
+    Output {
+        token,
+        line: message.to_string(),
+        then_close: false,
+    }
 }
 
 impl System {
@@ -216,7 +231,7 @@ impl System {
                         output.extend(
                             send_on_boarding(&client.nick)
                                 .into_iter()
-                                .map(|line| (token, line)),
+                                .map(|line| o(token, line)),
                         );
                         assert!(
                             self.registering.remove(&token).is_some(),
@@ -227,21 +242,27 @@ impl System {
                             "shouldn't be replacing an existing client"
                         );
                     }
-                    PreAuthOp::Ping(ref label) => output.push((token, render_ping(label))),
-                    PreAuthOp::Pong(ref label) => output.push((token, render_pong(label))),
+                    PreAuthOp::Ping(ref label) => output.push(o(token, render_ping(label))),
+                    PreAuthOp::Pong(ref label) => output.push(o(token, render_pong(label))),
                     PreAuthOp::Error(eo) => output.push(self.render_error(eo, token)),
                     PreAuthOp::FatalError(eo) => {
                         output.push(self.render_error(eo, token));
-                        output.push(unimplemented!("die"))
                     }
                 }
             }
         }
 
-        for (token, line) in output {
+        for Output {
+            token,
+            line,
+            then_close,
+        } in output
+        {
             if let Some(conn) = connections.get_mut(&token) {
                 if let Err(e) = conn.write_line(line) {
                     info!("{:?}: error sending normal message: {:?}", token, e);
+                    conn.start_closing();
+                } else if then_close {
                     conn.start_closing();
                 }
             }
@@ -252,7 +273,7 @@ impl System {
         &mut self,
         token: mio::Token,
         event: Req,
-    ) -> Result<Vec<(mio::Token, String)>, ClientError> {
+    ) -> Result<Vec<Output>, ClientError> {
         let mut output = Vec::with_capacity(4);
 
         let nick = self
@@ -264,42 +285,47 @@ impl System {
 
         match event {
             Req::JoinChannel(ref channel) => output.extend(self.joined(token, channel)),
-            Req::MessageIndividual(other_nick, msg) => output.push((
+            Req::MessageIndividual(other_nick, msg) => output.push(o(
                 token,
                 format!("{}!~@irc PRIVMSG {} :{}", nick, other_nick, msg),
             )),
             Req::MessageChannel(ref channel, ref msg) => {
                 output.extend(self.message_channel(token, &nick, channel, msg))
             }
-            Req::Ping(ref symbol) => output.push((token, render_ping(symbol))),
-            Req::Pong(ref symbol) => output.push((token, render_pong(symbol))),
-            Req::CloseClient => unimplemented!(),
+            Req::Ping(ref symbol) => output.push(o(token, render_ping(symbol))),
+            Req::Pong(ref symbol) => output.push(o(token, render_pong(symbol))),
         }
 
         Ok(output)
     }
 
-    fn render_error(&self, err: ClientError, us: mio::Token) -> (mio::Token, String) {
-        (
-            us,
-            match err {
-                ClientError::Die => unimplemented!("die"),
-                ClientError::ErrorReason(code, msg) => {
-                    format!(":ircd {:03} :{}", code.into_numeric(), msg)
-                }
-                ClientError::ErrorNickReason(code, msg) => {
-                    let nick = self
-                        .clients
-                        .get(&us)
-                        .map(|client| client.nick.as_str())
-                        .unwrap_or("*");
-                    format!(":ircd {:03} {} :{}", code.into_numeric(), nick, msg)
-                }
-                ClientError::ErrorWordReason(code, word, msg) => {
-                    format!(":ircd {:03} {} :{}", code.into_numeric(), word, msg)
-                }
+    fn render_error(&self, err: ClientError, us: mio::Token) -> Output {
+        match err {
+            ClientError::Die => Output {
+                token: us,
+                line: ":ircd 999 * :You angered us in some deprecated way, sorry. Bye.".to_string(),
+                then_close: true,
             },
-        )
+            ClientError::ErrorReason(code, msg) => {
+                // I don't think this star should be here, but xchat eats words otherwise.
+                o(us, format!(":ircd {:03} * :{}", code.into_numeric(), msg))
+            }
+            ClientError::ErrorNickReason(code, msg) => {
+                let nick = self
+                    .clients
+                    .get(&us)
+                    .map(|client| client.nick.as_str())
+                    .unwrap_or("*");
+                o(
+                    us,
+                    format!(":ircd {:03} {} :{}", code.into_numeric(), nick, msg),
+                )
+            }
+            ClientError::ErrorWordReason(code, word, msg) => o(
+                us,
+                format!(":ircd {:03} {} :{}", code.into_numeric(), word, msg),
+            ),
+        }
     }
 
     /// https://modern.ircdocs.horse/#connection-registration
@@ -429,7 +455,7 @@ impl System {
         our_nick: &str,
         channel: &str,
         msg: &str,
-    ) -> Vec<(mio::Token, String)> {
+    ) -> Vec<Output> {
         let mut output = Vec::with_capacity(32);
 
         let id = self.store.load_channel(channel);
@@ -444,7 +470,7 @@ impl System {
                 continue;
             }
 
-            output.push((
+            output.push(o(
                 *other_token,
                 format!(":{}!~@irc PRIVMSG {} :{}", our_nick, channel, msg),
             ));
@@ -453,7 +479,7 @@ impl System {
         output
     }
 
-    fn joined(&mut self, us: mio::Token, chan: &String) -> Vec<(mio::Token, String)> {
+    fn joined(&mut self, us: mio::Token, chan: &String) -> Vec<Output> {
         let mut output = Vec::with_capacity(32);
         let id = self.store.load_channel(chan);
 
@@ -475,11 +501,11 @@ impl System {
             if !other_client.channels.contains(&id) {
                 continue;
             }
-            output.push((*other_token, format!(":{}!~@irc JOIN {}", nick, chan)));
+            output.push(o(*other_token, format!(":{}!~@irc JOIN {}", nick, chan)));
         }
 
         // send us some details
-        output.push((
+        output.push(o(
             us,
             format!(
                 ":ircd 332 {} {} :This topic intentionally left blank.",
@@ -520,13 +546,13 @@ impl System {
         }
 
         for names in blocks {
-            output.push((
+            output.push(o(
                 us,
                 format!(":ircd 353 {} @ {} :{} {}", nick, chan, nick, names),
             ));
         }
 
-        output.push((us, format!(":ircd 366 {} {} :</names>", nick, chan)));
+        output.push(o(us, format!(":ircd 366 {} {} :</names>", nick, chan)));
 
         output
     }

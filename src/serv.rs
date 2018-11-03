@@ -289,7 +289,7 @@ fn make_config() -> Result<rustls::ServerConfig, Error> {
 pub fn serve_forever<F: FnMut(&HashSet<Token>, &mut Connections)>(
     mut work: F,
 ) -> Result<(), Error> {
-    let addr: net::SocketAddr = "127.0.0.1:6697".parse()?;
+    let addr: net::SocketAddr = "0.0.0.0:6697".parse()?;
 
     let config = Arc::new(make_config()?);
 
