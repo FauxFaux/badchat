@@ -381,7 +381,11 @@ impl System {
         if state.pass.is_none() {
             return PreAuthOp::Error(ClientError::FatalReason(
                 ErrorCode::PasswordMismatch,
-                "You must provide a password",
+                concat!(
+                    "You must provide a password, ",
+                    "for an unregistered account, any password is fine! ",
+                    "I'll just make you a new account."
+                ),
             ));
         }
 
