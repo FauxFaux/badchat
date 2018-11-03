@@ -379,7 +379,7 @@ impl System {
         }
 
         if state.pass.is_none() {
-            return PreAuthOp::Error(ClientError::ErrorReason(
+            return PreAuthOp::Error(ClientError::FatalReason(
                 ErrorCode::PasswordMismatch,
                 "You must provide a password",
             ));
