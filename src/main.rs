@@ -12,6 +12,7 @@ extern crate rusqlite;
 extern crate rustls;
 extern crate vecio;
 
+mod proto;
 mod serv;
 mod store;
 
