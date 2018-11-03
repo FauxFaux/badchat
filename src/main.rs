@@ -245,27 +245,27 @@ impl System {
         }
     }
 
-    fn translate_event(&mut self, token: mio::Token, event: Req) -> Vec<Output> {
+    fn translate_event(&mut self, us: mio::Token, event: Req) -> Vec<Output> {
         let mut output = Vec::with_capacity(4);
 
         let nick = self
             .clients
-            .get(&token)
+            .get(&us)
             .expect("invalid client")
             .nick
             .to_string();
 
         match event {
-            Req::JoinChannel(ref channel) => output.extend(self.joined(token, channel)),
+            Req::JoinChannel(ref channel) => output.extend(self.joined(us, channel)),
             Req::MessageIndividual(other_nick, msg) => output.push(o(
-                token,
+                us,
                 format!("{}!~@irc PRIVMSG {} :{}", nick, other_nick, msg),
             )),
             Req::MessageChannel(ref channel, ref msg) => {
-                output.extend(self.message_channel(token, &nick, channel, msg))
+                output.extend(self.message_channel(us, &nick, channel, msg))
             }
-            Req::Ping(ref symbol) => output.push(o(token, render_ping(symbol))),
-            Req::Pong(ref symbol) => output.push(o(token, render_pong(symbol))),
+            Req::Ping(ref symbol) => output.push(o(us, render_ping(symbol))),
+            Req::Pong(ref symbol) => output.push(o(us, render_pong(symbol))),
         }
 
         output
@@ -359,8 +359,8 @@ impl System {
             return PreAuthOp::Error(ClientError::FatalReason(
                 ErrorCode::PasswordMismatch,
                 concat!(
-                    "You must provide a password, ",
-                    "for an unregistered account, any password is fine! ",
+                    "You must provide a password. ",
+                    "For an unregistered nick, any password is fine! ",
                     "I'll just make you a new account."
                 ),
             ));
