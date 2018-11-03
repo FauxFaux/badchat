@@ -206,32 +206,26 @@ impl System {
                 }
             };
 
-            // I don't like this nested error handling. None of the collect() stuff works 'cos we
-            // want to maintain order, and process everything. The main purpose was to simplify
-            // translate_event, which hasn't happened. Maybe nest into the `Req`?
-
-            if self.clients.contains_key(&token) {
-                output.extend(
-                    self.translate_client_message(message)
-                        .map(|events| {
-                            events
-                                .into_iter()
-                                .flat_map(|event| self.translate_event(token, event))
-                                // TODO: it feels like this collect should be unnecessary, but can't
-                                // TODO: reconcile the types with the vec![] below in the error handling
-                                .collect()
-                        })
-                        .unwrap_or_else(|err| vec![self.render_error(err, token)]),
-                );
+            output.extend(if self.clients.contains_key(&token) {
+                self.translate_client_message(message)
+                    .map(|events| {
+                        events
+                            .into_iter()
+                            .flat_map(|event| self.translate_event(token, event))
+                            // TODO: it feels like this collect should be unnecessary, but can't
+                            // TODO: reconcile the types with the vec![] below in the error handling
+                            .collect()
+                    })
+                    .unwrap_or_else(|err| vec![self.render_error(err, token)])
             } else {
                 match self.translate_pre_auth(token, message) {
-                    PreAuthOp::Waiting => (),
+                    PreAuthOp::Waiting => vec![],
                     PreAuthOp::Complete(client) => {
-                        output.extend(
-                            send_on_boarding(&client.nick)
-                                .into_iter()
-                                .map(|line| o(token, line)),
-                        );
+                        let on_boarding = send_on_boarding(&client.nick)
+                            .into_iter()
+                            .map(|line| o(token, line))
+                            .collect();
+
                         assert!(
                             self.registering.remove(&token).is_some(),
                             "should be removing a registering client"
@@ -240,12 +234,14 @@ impl System {
                             self.clients.insert(token, client).is_none(),
                             "shouldn't be replacing an existing client"
                         );
+
+                        on_boarding
                     }
-                    PreAuthOp::Ping(ref label) => output.push(o(token, render_ping(label))),
-                    PreAuthOp::Pong(ref label) => output.push(o(token, render_pong(label))),
-                    PreAuthOp::Error(eo) => output.push(self.render_error(eo, token)),
+                    PreAuthOp::Ping(ref label) => vec![o(token, render_ping(label))],
+                    PreAuthOp::Pong(ref label) => vec![o(token, render_pong(label))],
+                    PreAuthOp::Error(eo) => vec![self.render_error(eo, token)],
                 }
-            }
+            });
         }
 
         for Output {
