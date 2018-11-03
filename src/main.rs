@@ -211,17 +211,18 @@ impl System {
             // translate_event, which hasn't happened. Maybe nest into the `Req`?
 
             if self.clients.contains_key(&token) {
-                match self.translate_client_message(message) {
-                    Ok(events) => {
-                        for event in events {
-                            match self.translate_event(token, event) {
-                                Ok(lines) => output.extend(lines),
-                                Err(e) => output.push(self.render_error(e, token)),
-                            }
-                        }
-                    }
-                    Err(e) => output.push(self.render_error(e, token)),
-                }
+                output.extend(
+                    self.translate_client_message(message)
+                        .map(|events| {
+                            events
+                                .into_iter()
+                                .flat_map(|event| self.translate_event(token, event))
+                                // TODO: it feels like this collect should be unnecessary, but can't
+                                // TODO: reconcile the types with the vec![] below in the error handling
+                                .collect()
+                        })
+                        .unwrap_or_else(|err| vec![self.render_error(err, token)]),
+                );
             } else {
                 match self.translate_pre_auth(token, message) {
                     PreAuthOp::Waiting => (),
@@ -264,11 +265,7 @@ impl System {
         }
     }
 
-    fn translate_event(
-        &mut self,
-        token: mio::Token,
-        event: Req,
-    ) -> Result<Vec<Output>, ClientError> {
+    fn translate_event(&mut self, token: mio::Token, event: Req) -> Vec<Output> {
         let mut output = Vec::with_capacity(4);
 
         let nick = self
@@ -291,7 +288,7 @@ impl System {
             Req::Pong(ref symbol) => output.push(o(token, render_pong(symbol))),
         }
 
-        Ok(output)
+        output
     }
 
     fn render_error(&self, err: ClientError, us: mio::Token) -> Output {
