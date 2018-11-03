@@ -517,37 +517,12 @@ impl System {
         // @: secret channel (+s)
         // TODO: client modes in a channel
 
-        const WRAP_AT: usize = 400;
-        let mut blocks = Vec::with_capacity(8);
-        let mut block = String::with_capacity(WRAP_AT + 32);
-        for name in self
-            .clients
-            .values()
-            .filter(|client| client.channels.contains(&id))
-            .map(|client| client.nick.as_ref())
-        {
-            block.push_str(name);
-
-            if block.len() > WRAP_AT {
-                blocks.push(block.to_string());
-                block.clear();
-            }
-
-            block.push(' ');
-        }
-
-        if let Some(val) = block.pop() {
-            assert_eq!(
-                ' ', val,
-                "if the block has an end, it should end in a space"
-            );
-        }
-
-        if !block.is_empty() {
-            blocks.push(block);
-        }
-
-        for names in blocks {
+        for names in wrapped(
+            self.clients
+                .values()
+                .filter(|client| client.channels.contains(&id))
+                .map(|client| client.nick.as_ref()),
+        ) {
             output.push(o(
                 us,
                 format!(":ircd 353 {} @ {} :{} {}", nick, chan, nick, names),
@@ -558,6 +533,36 @@ impl System {
 
         output
     }
+}
+
+fn wrapped<'i, I: IntoIterator<Item = &'i str>>(it: I) -> Vec<String> {
+    const WRAP_AT: usize = 400;
+
+    let mut blocks = Vec::with_capacity(8);
+    let mut block = String::with_capacity(WRAP_AT + 32);
+    for name in it {
+        block.push_str(name);
+
+        if block.len() > WRAP_AT {
+            blocks.push(block.to_string());
+            block.clear();
+        }
+
+        block.push(' ');
+    }
+
+    if let Some(val) = block.pop() {
+        assert_eq!(
+            ' ', val,
+            "if the block has an end, it should end in a space"
+        );
+    }
+
+    if !block.is_empty() {
+        blocks.push(block);
+    }
+
+    blocks
 }
 
 fn take_messages(conn: &mut serv::Connection) -> Vec<Result<irc_proto::Message, ClientError>> {
