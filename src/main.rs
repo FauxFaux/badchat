@@ -144,6 +144,7 @@ enum Req {
 #[derive(Debug, Copy, Clone)]
 enum ClientError {
     Die,
+    FatalReason(ErrorCode, &'static str),
     ErrorReason(ErrorCode, &'static str),
     ErrorNickReason(ErrorCode, &'static str),
     ErrorWordReason(ErrorCode, &'static str, &'static str),
@@ -155,9 +156,6 @@ enum PreAuthOp {
     Ping(String),
     Pong(String),
     Error(ClientError),
-
-    /// Mmm, no. We should extend ClientError with a proper ::Die.
-    FatalError(ClientError),
 }
 
 struct Output {
@@ -245,9 +243,6 @@ impl System {
                     PreAuthOp::Ping(ref label) => output.push(o(token, render_ping(label))),
                     PreAuthOp::Pong(ref label) => output.push(o(token, render_pong(label))),
                     PreAuthOp::Error(eo) => output.push(self.render_error(eo, token)),
-                    PreAuthOp::FatalError(eo) => {
-                        output.push(self.render_error(eo, token));
-                    }
                 }
             }
         }
@@ -303,12 +298,20 @@ impl System {
         match err {
             ClientError::Die => Output {
                 token: us,
-                line: ":ircd 999 * :You angered us in some deprecated way, sorry. Bye.".to_string(),
+                line: ":ircd 999 * :You angered us in some way, sorry. Bye.".to_string(),
                 then_close: true,
             },
             ClientError::ErrorReason(code, msg) => {
                 // I don't think this star should be here, but xchat eats words otherwise.
                 o(us, format!(":ircd {:03} * :{}", code.into_numeric(), msg))
+            }
+            ClientError::FatalReason(code, msg) => {
+                // Same format string (bug) as above
+                Output {
+                    token: us,
+                    line: format!(":ircd {:03} * :{}", code.into_numeric(), msg),
+                    then_close: true,
+                }
             }
             ClientError::ErrorNickReason(code, msg) => {
                 let nick = self
@@ -376,7 +379,7 @@ impl System {
         }
 
         if state.pass.is_none() {
-            return PreAuthOp::FatalError(ClientError::ErrorReason(
+            return PreAuthOp::Error(ClientError::ErrorReason(
                 ErrorCode::PasswordMismatch,
                 "You must provide a password",
             ));
@@ -387,7 +390,7 @@ impl System {
         let account_id = match self.store.user(nick, state.pass.as_ref().unwrap()) {
             Some(id) => id,
             None => {
-                return PreAuthOp::FatalError(ClientError::ErrorReason(
+                return PreAuthOp::Error(ClientError::FatalReason(
                     ErrorCode::PasswordMismatch,
                     concat!(
                         "Incorrect password for account. If you don't know",
