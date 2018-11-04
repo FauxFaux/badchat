@@ -101,12 +101,50 @@ impl<'b> ParsedMessage<'b> {
         self.args.map(|v| &self.buf[v.range()])
     }
 
-    fn args(&self) -> ParsedArgs {
+    fn args_iter(&self) -> ParsedArgs {
         ParsedArgs {
             buf: self.args_str().unwrap_or(""),
             pos: 0,
         }
     }
+
+    fn args(&self) -> ShortArgs {
+        let mut it = self.args_iter();
+        let first = match it.next() {
+            Some(val) => val,
+            None => return ShortArgs::Zero,
+        };
+
+        let second = match it.next() {
+            Some(val) => val,
+            None => return ShortArgs::One(first),
+        };
+
+        let third = match it.next() {
+            Some(val) => val,
+            None => return ShortArgs::Two(first, second),
+        };
+
+        let fourth = match it.next() {
+            Some(val) => val,
+            None => return ShortArgs::Three(first, second, third),
+        };
+
+        match it.next() {
+            None => ShortArgs::Four(first, second, third, fourth),
+            Some(_) => ShortArgs::More,
+        }
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum ShortArgs<'s> {
+    Zero,
+    One(&'s str),
+    Two(&'s str, &'s str),
+    Three(&'s str, &'s str, &'s str),
+    Four(&'s str, &'s str, &'s str, &'s str),
+    More,
 }
 
 impl<'i> Iterator for ParsedArgs<'i> {
@@ -179,6 +217,7 @@ impl From<Range<usize>> for SubStr {
 #[cfg(test)]
 mod tests {
     use super::parse_message;
+    use super::ShortArgs;
 
     fn assert_parses_to(expected: (Option<&str>, Option<&str>, &str, Option<&str>), input: &str) {
         let m = parse_message(input).expect(&format!("parsing {}", input));
@@ -211,16 +250,22 @@ mod tests {
     fn parse_args() {
         let private = parse_message("PRIVMSG #woo :foo bar").unwrap();
         assert_eq!("PRIVMSG", private.cmd_str());
-        assert_eq!(vec!["#woo", "foo bar"], private.args().collect::<Vec<_>>());
+        assert_eq!(
+            vec!["#woo", "foo bar"],
+            private.args_iter().collect::<Vec<_>>()
+        );
+        assert_eq!(ShortArgs::Two("#woo", "foo bar"), private.args());
 
         let user = parse_message("USER foo bar 0 :Real Name").unwrap();
         assert_eq!("USER", user.cmd_str());
         assert_eq!(
             vec!["foo", "bar", "0", "Real Name"],
-            user.args().collect::<Vec<_>>()
+            user.args_iter().collect::<Vec<_>>()
         );
+        assert_eq!(ShortArgs::Four("foo", "bar", "0", "Real Name"), user.args());
 
         let quit = parse_message("QUIT").unwrap();
-        assert_eq!(Vec::<&str>::new(), quit.args().collect::<Vec<_>>());
+        assert_eq!(Vec::<&str>::new(), quit.args_iter().collect::<Vec<_>>());
+        assert_eq!(ShortArgs::Zero, quit.args());
     }
 }
