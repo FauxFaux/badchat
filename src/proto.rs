@@ -21,6 +21,12 @@ fn parse_message(from: &str) -> Result<ParsedMessage, &'static str> {
         return Err("whitespace start");
     }
 
+    // TODO: colours
+    // Perfectly happy with this eliminating tab, etc.
+    if from.contains(|c: char| c.is_ascii_control()) {
+        return Err("banned characters");
+    }
+
     let mut here = 0;
 
     let mut tags = None;
