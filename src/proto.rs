@@ -9,6 +9,13 @@ struct ParsedMessage<'b> {
     args: Option<SubStr>,
 }
 
+struct ParsedArgs<'b> {
+    buf: &'b str,
+    pos: usize,
+}
+
+// TODO: not sure it's clearer to have this not in terms of a generic
+// TODO: iterator, which understands the two different :-prefixed arguments
 fn parse_message(from: &str) -> Result<ParsedMessage, &'static str> {
     if from.starts_with(' ') {
         return Err("whitespace start");
@@ -87,6 +94,40 @@ impl<'b> ParsedMessage<'b> {
     fn args_str(&self) -> Option<&str> {
         self.args.map(|v| &self.buf[v.range()])
     }
+
+    fn args(&self) -> ParsedArgs {
+        ParsedArgs {
+            buf: self.args_str().unwrap_or(""),
+            pos: 0,
+        }
+    }
+}
+
+impl<'i> Iterator for ParsedArgs<'i> {
+    type Item = &'i str;
+
+    fn next(&mut self) -> Option<&'i str> {
+        // drop leading whitespace
+        while self.buf[self.pos..].starts_with(' ') {
+            self.pos += 1;
+        }
+
+        // if it's empty, we're done
+        if self.buf[self.pos..].is_empty() {
+            return None;
+        }
+
+        if self.buf[self.pos..].starts_with(':') {
+            let rest = &self.buf[self.pos + 1..];
+            self.pos = self.buf.len();
+            return Some(rest);
+        }
+
+        let remaining = &self.buf[self.pos..];
+        let len = remaining.find(' ').unwrap_or(remaining.len());
+        self.pos += len;
+        Some(&remaining[..len])
+    }
 }
 
 /// Range<> isn't Copy because it makes iterators *horrible*.
@@ -140,7 +181,7 @@ mod tests {
     }
 
     #[test]
-    fn parse() {
+    fn parse_commands() {
         assert_eq!(Err("empty command"), parse_message(""));
         assert_eq!(Err("only source"), parse_message(":woo"));
         assert_eq!(Err("only tags"), parse_message("@woo"));
@@ -158,5 +199,22 @@ mod tests {
             (Some("eye"), Some("eye"), "CAPTAIN", None),
             "@eye :eye CAPTAIN",
         );
+    }
+
+    #[test]
+    fn parse_args() {
+        let private = parse_message("PRIVMSG #woo :foo bar").unwrap();
+        assert_eq!("PRIVMSG", private.cmd_str());
+        assert_eq!(vec!["#woo", "foo bar"], private.args().collect::<Vec<_>>());
+
+        let user = parse_message("USER foo bar 0 :Real Name").unwrap();
+        assert_eq!("USER", user.cmd_str());
+        assert_eq!(
+            vec!["foo", "bar", "0", "Real Name"],
+            user.args().collect::<Vec<_>>()
+        );
+
+        let quit = parse_message("QUIT").unwrap();
+        assert_eq!(Vec::<&str>::new(), quit.args().collect::<Vec<_>>());
     }
 }
