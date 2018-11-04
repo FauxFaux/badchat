@@ -2,7 +2,6 @@ extern crate cast;
 extern crate env_logger;
 #[macro_use]
 extern crate failure;
-extern crate irc_proto;
 #[macro_use]
 extern crate log;
 extern crate mio;
@@ -23,9 +22,10 @@ use std::fmt;
 
 use failure::Error;
 use failure::ResultExt;
-use irc_proto::Command;
-use irc_proto::Message;
 use rand::Rng;
+
+use self::proto::Command;
+use self::proto::ParsedMessage as Message;
 
 type ConnId = mio::Token;
 
@@ -313,9 +313,9 @@ impl System {
     fn translate_pre_auth(&mut self, token: mio::Token, message: Message) -> PreAuthOp {
         let mut state = self.registering.entry(token).or_default();
 
-        match message.command {
-            Command::PASS(pass) => state.pass = Some(pass),
-            Command::NICK(nick) => {
+        match message.command() {
+            Ok(Command::Pass(pass)) => state.pass = Some(pass.to_string()),
+            Ok(Command::Nick(nick)) => {
                 if !valid_nick(&nick) {
                     return PreAuthOp::Error(ClientError::ErrorNickReason(
                         ErrorCode::ErroneousNickname,
@@ -323,22 +323,24 @@ impl System {
                     ));
                 }
 
-                state.nick = Some(nick);
+                state.nick = Some(nick.to_string());
 
                 if state.ping == PreAuthPing::WaitingForNick {
                     state.ping = PreAuthPing::WaitingForPong;
                     return PreAuthOp::Ping(format!("{:08x}", state.ping_token.0));
                 }
             }
-            Command::USER(ident, _mode, real_name) => state.gecos = Some((ident, real_name)),
-            Command::PING(arg, _trail) => return PreAuthOp::Pong(arg),
-            Command::PONG(ref arg, _)
+            Ok(Command::User(ident, _mode, real_name)) => {
+                state.gecos = Some((ident.to_string(), real_name.to_string()))
+            }
+            Ok(Command::Ping(arg)) => return PreAuthOp::Pong(arg.to_string()),
+            Ok(Command::Pong(ref arg))
                 if PreAuthPing::WaitingForPong == state.ping
                     && u64::from_str_radix(arg, 16) == Ok(state.ping_token.0) =>
             {
                 state.ping = PreAuthPing::Complete
             }
-            Command::Raw(ref raw, ..) if is_http_verb(raw) => {
+            Ok(Command::Other(ref raw, ..)) if is_http_verb(raw) => {
                 info!("http command on channel: {:?}", raw);
                 // TODO: is it worth sending them anything?
                 return PreAuthOp::Error(ClientError::Die);
@@ -390,8 +392,8 @@ impl System {
     }
 
     fn translate_client_message(&mut self, message: Message) -> Result<Vec<Req>, ClientError> {
-        match message.command {
-            Command::JOIN(ref chan, ref keys, ref real_name)
+        match message.command() {
+            Ok(Command::Join(ref chan, ref keys, ref real_name))
                 if keys.is_none() && real_name.is_none() =>
             {
                 let mut joins = Vec::with_capacity(4);
@@ -409,11 +411,14 @@ impl System {
                 }
                 Ok(joins)
             }
-            Command::PRIVMSG(dest, msg) => {
+            Ok(Command::Privmsg(dest, msg)) => {
                 if dest.starts_with('#') && valid_channel(&dest) {
-                    Ok(vec![Req::MessageChannel(dest, msg)])
+                    Ok(vec![Req::MessageChannel(dest.to_string(), msg.to_string())])
                 } else if valid_nick(&dest) {
-                    Ok(vec![Req::MessageIndividual(dest, msg)])
+                    Ok(vec![Req::MessageIndividual(
+                        dest.to_string(),
+                        msg.to_string(),
+                    )])
                 } else {
                     Err(ClientError::ErrorWordReason(
                         ErrorCode::NoSuchNick,
@@ -422,8 +427,8 @@ impl System {
                     ))
                 }
             }
-            Command::PING(arg, _) => Ok(vec![Req::Pong(arg)]),
-            Command::PONG(..) => Ok(vec![]),
+            Ok(Command::Ping(arg)) => Ok(vec![Req::Pong(arg.to_string())]),
+            Ok(Command::Pong(..)) => Ok(vec![]),
             other => {
                 info!("invalid command: {:?}", other);
                 Err(ClientError::ErrorNickReason(
@@ -566,7 +571,7 @@ fn wrapped<'i, I: IntoIterator<Item = &'i str>>(it: I) -> Vec<String> {
     blocks
 }
 
-fn take_messages(conn: &mut serv::Connection) -> Vec<Result<irc_proto::Message, ClientError>> {
+fn take_messages(conn: &mut serv::Connection) -> Vec<Result<Message, ClientError>> {
     if conn.broken_input {
         match pop_line(&mut conn.input_buffer) {
             PoppedLine::Done(_) | PoppedLine::TooLong => {
@@ -647,7 +652,7 @@ fn send_on_boarding<D: fmt::Display>(nick: D) -> Vec<String> {
 fn line_to_message(
     token: mio::Token,
     input_buffer: &mut VecDeque<u8>,
-) -> Result<Option<irc_proto::Message>, ClientError> {
+) -> Result<Option<Message>, ClientError> {
     let line = match pop_line(input_buffer) {
         PoppedLine::Done(line) => line,
         PoppedLine::NotReady => return Ok(None),
@@ -669,8 +674,8 @@ fn line_to_message(
 
     trace!("{:?}: line: {:?}", token, line);
 
-    Ok(Some(line.parse().map_err(|parse_error| {
-        debug!("{:?}: bad command: {:?} {:?}", token, line, parse_error);
+    Ok(Some(proto::parse_message(line).map_err(|parse_error| {
+        debug!("{:?}: bad command: {:?}", token, parse_error);
         ClientError::ErrorReason(
             ErrorCode::UnknownError,
             "Unable to parse your input as any form of message",

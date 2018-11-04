@@ -1,11 +1,18 @@
 use std::ops::Range;
 
+#[derive(Copy, Clone, Debug)]
 pub enum Command<'s> {
     Pass(&'s str),
     Nick(&'s str),
 
+    Ping(&'s str),
+    Pong(&'s str),
+
     /// user, mode, [*], real-name
     User(&'s str, &'s str, &'s str),
+
+    /// channel[,channel] key[,key] real-name
+    Join(&'s str, Option<&'s str>, Option<&'s str>),
 
     /// dest, message
     Privmsg(&'s str, &'s str),
@@ -164,6 +171,16 @@ impl ParsedMessage {
                 ShortArgs::One(arg) => Ok(Command::Nick(arg)),
                 _ => Err("NICK takes exactly one arg"),
             }
+        } else if cmd.eq_ignore_ascii_case("PING") {
+            match self.args() {
+                ShortArgs::One(arg) => Ok(Command::Ping(arg)),
+                _ => Err("PING takes exactly one arg (non-standard)"),
+            }
+        } else if cmd.eq_ignore_ascii_case("PONG") {
+            match self.args() {
+                ShortArgs::One(arg) => Ok(Command::Pong(arg)),
+                _ => Err("PONG takes exactly one arg (non-standard)"),
+            }
         } else if cmd.eq_ignore_ascii_case("USER") {
             match self.args() {
                 ShortArgs::Four(user, mode, _star, real_name) => {
@@ -181,6 +198,15 @@ impl ParsedMessage {
                 ShortArgs::Zero => Ok(Command::Quit(None)),
                 ShortArgs::One(arg) => Ok(Command::Quit(Some(arg))),
                 _ => Err("QUIT takes one optional arg"),
+            }
+        } else if cmd.eq_ignore_ascii_case("JOIN") {
+            match self.args() {
+                ShortArgs::One(channels) => Ok(Command::Join(channels, None, None)),
+                ShortArgs::Two(channels, keys) => Ok(Command::Join(channels, Some(keys), None)),
+                ShortArgs::Three(channels, keys, real_name) => {
+                    Ok(Command::Join(channels, Some(keys), Some(real_name)))
+                }
+                _ => Err("JOIN takes channels, maybe keys, and maybe names"),
             }
         } else {
             Ok(Command::Other(cmd))
