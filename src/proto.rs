@@ -14,9 +14,11 @@ pub enum Command<'s> {
     Other(&'s str),
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct ParsedMessage<'b> {
-    buf: &'b str,
+type SubStr = Range<usize>;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParsedMessage {
+    buf: String,
     tags: Option<SubStr>,
     source: Option<SubStr>,
     cmd: SubStr,
@@ -30,7 +32,7 @@ pub struct ParsedArgs<'b> {
 
 // TODO: not sure it's clearer to have this not in terms of a generic
 // TODO: iterator, which understands the two different :-prefixed arguments
-pub fn parse_message(from: &str) -> Result<ParsedMessage, &'static str> {
+pub fn parse_message(from: String) -> Result<ParsedMessage, &'static str> {
     if from.starts_with(' ') {
         return Err("whitespace start");
     }
@@ -85,7 +87,7 @@ pub fn parse_message(from: &str) -> Result<ParsedMessage, &'static str> {
         None
     };
 
-    if cmd.is_empty() {
+    if cmd.start >= cmd.end {
         return Err("empty command");
     }
 
@@ -98,21 +100,21 @@ pub fn parse_message(from: &str) -> Result<ParsedMessage, &'static str> {
     })
 }
 
-impl<'b> ParsedMessage<'b> {
+impl ParsedMessage {
     fn tags_str(&self) -> Option<&str> {
-        self.tags.map(|v| &self.buf[v.range()])
+        self.tags.as_ref().map(|v| &self.buf[v.clone()])
     }
 
     fn source_str(&self) -> Option<&str> {
-        self.source.map(|v| &self.buf[v.range()])
+        self.source.as_ref().map(|v| &self.buf[v.clone()])
     }
 
     fn cmd_str(&self) -> &str {
-        &self.buf[self.cmd.range()]
+        &self.buf[self.cmd.clone()]
     }
 
     fn args_str(&self) -> Option<&str> {
-        self.args.map(|v| &self.buf[v.range()])
+        self.args.as_ref().map(|v| &self.buf[v.clone()])
     }
 
     pub fn args_iter(&self) -> ParsedArgs {
@@ -223,66 +225,37 @@ impl<'i> Iterator for ParsedArgs<'i> {
     }
 }
 
-/// Range<> isn't Copy because it makes iterators *horrible*.
-/// https://github.com/rust-lang/rust/pull/27186
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-struct SubStr {
-    start: usize,
-    end: usize,
-}
-
-impl SubStr {
-    fn is_empty(self) -> bool {
-        self.start >= self.end
-    }
-
-    #[inline]
-    fn range(self) -> Range<usize> {
-        Range {
-            start: self.start,
-            end: self.end,
-        }
-    }
-}
-
-impl Into<Range<usize>> for SubStr {
-    fn into(self) -> Range<usize> {
-        Range {
-            start: self.start,
-            end: self.end,
-        }
-    }
-}
-
-impl From<Range<usize>> for SubStr {
-    fn from(them: Range<usize>) -> Self {
-        SubStr {
-            start: them.start,
-            end: them.end,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use std::fmt;
+
     use super::parse_message;
     use super::ShortArgs;
 
-    fn assert_parses_to(expected: (Option<&str>, Option<&str>, &str, Option<&str>), input: &str) {
-        let m = parse_message(input).expect(&format!("parsing {}", input));
+    fn assert_parses_to<S: ToString + fmt::Display>(
+        expected: (Option<&str>, Option<&str>, &str, Option<&str>),
+        input: S,
+    ) {
+        let m = parse_message(input.to_string()).expect(&format!("parsing {}", input));
         let actual = (m.tags_str(), m.source_str(), m.cmd_str(), m.args_str());
         assert_eq!(expected, actual);
     }
 
     #[test]
     fn parse_commands() {
-        assert_eq!(Err("empty command"), parse_message(""));
-        assert_eq!(Err("only source"), parse_message(":woo"));
-        assert_eq!(Err("only tags"), parse_message("@woo"));
-        assert_eq!(Err("only source"), parse_message("@woo :woo"));
-        assert_eq!(Err("empty command"), parse_message("@woo :woo "));
-        assert_eq!(Err("empty command"), parse_message("@woo :woo  "));
-        assert_eq!(Err("whitespace start"), parse_message(" "));
+        assert_eq!(Err("empty command"), parse_message("".to_string()));
+        assert_eq!(Err("only source"), parse_message(":woo".to_string()));
+        assert_eq!(Err("only tags"), parse_message("@woo".to_string()));
+        assert_eq!(Err("only source"), parse_message("@woo :woo".to_string()));
+        assert_eq!(
+            Err("empty command"),
+            parse_message("@woo :woo ".to_string())
+        );
+        assert_eq!(
+            Err("empty command"),
+            parse_message("@woo :woo  ".to_string())
+        );
+        assert_eq!(Err("whitespace start"), parse_message(" ".to_string()));
 
         assert_parses_to((None, None, "QUIT", None), "QUIT");
         assert_parses_to((None, Some("eye"), "QUIT", None), ":eye QUIT");
@@ -297,7 +270,7 @@ mod tests {
 
     #[test]
     fn parse_args() {
-        let private = parse_message("PRIVMSG #woo :foo bar").unwrap();
+        let private = parse_message("PRIVMSG #woo :foo bar".to_string()).unwrap();
         assert_eq!("PRIVMSG", private.cmd_str());
         assert_eq!(
             vec!["#woo", "foo bar"],
@@ -305,7 +278,7 @@ mod tests {
         );
         assert_eq!(ShortArgs::Two("#woo", "foo bar"), private.args());
 
-        let user = parse_message("USER foo bar 0 :Real Name").unwrap();
+        let user = parse_message("USER foo bar 0 :Real Name".to_string()).unwrap();
         assert_eq!("USER", user.cmd_str());
         assert_eq!(
             vec!["foo", "bar", "0", "Real Name"],
@@ -313,7 +286,7 @@ mod tests {
         );
         assert_eq!(ShortArgs::Four("foo", "bar", "0", "Real Name"), user.args());
 
-        let quit = parse_message("QUIT").unwrap();
+        let quit = parse_message("QUIT".to_string()).unwrap();
         assert_eq!(Vec::<&str>::new(), quit.args_iter().collect::<Vec<_>>());
         assert_eq!(ShortArgs::Zero, quit.args());
     }
