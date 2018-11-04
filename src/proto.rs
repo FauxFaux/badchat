@@ -1,5 +1,16 @@
 use std::ops::Range;
 
+enum Command<'s> {
+    Pass(&'s str),
+    Nick(&'s str),
+    User(&'s str, &'s str, &'s str),
+
+    Privmsg(&'s str, &'s str),
+
+    Quit(Option<&'s str>),
+    Other(&'s str),
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 struct ParsedMessage<'b> {
     buf: &'b str,
@@ -133,6 +144,41 @@ impl<'b> ParsedMessage<'b> {
         match it.next() {
             None => ShortArgs::Four(first, second, third, fourth),
             Some(_) => ShortArgs::More,
+        }
+    }
+
+    fn command(&self) -> Result<Command, &'static str> {
+        let cmd = self.cmd_str();
+        if cmd.eq_ignore_ascii_case("PRIVMSG") {
+            match self.args() {
+                ShortArgs::Two(dest, msg) => Ok(Command::Privmsg(dest, msg)),
+                _ => Err("PRIVMSG takes exactly two args"),
+            }
+        } else if cmd.eq_ignore_ascii_case("NICK") {
+            match self.args() {
+                ShortArgs::One(arg) => Ok(Command::Nick(arg)),
+                _ => Err("NICK takes exactly one arg"),
+            }
+        } else if cmd.eq_ignore_ascii_case("USER") {
+            match self.args() {
+                ShortArgs::Four(user, mode, _star, real_name) => {
+                    Ok(Command::User(user, mode, real_name))
+                }
+                _ => Err("USER takes exactly four args (user, mode, *, real name)"),
+            }
+        } else if cmd.eq_ignore_ascii_case("PASS") {
+            match self.args() {
+                ShortArgs::One(arg) => Ok(Command::Pass(arg)),
+                _ => Err("PASS takes exactly one arg"),
+            }
+        } else if cmd.eq_ignore_ascii_case("QUIT") {
+            match self.args() {
+                ShortArgs::Zero => Ok(Command::Quit(None)),
+                ShortArgs::One(arg) => Ok(Command::Quit(Some(arg))),
+                _ => Err("QUIT takes one optional arg"),
+            }
+        } else {
+            Ok(Command::Other(cmd))
         }
     }
 }
