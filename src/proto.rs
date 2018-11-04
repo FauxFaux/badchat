@@ -1,10 +1,13 @@
 use std::ops::Range;
 
-enum Command<'s> {
+pub enum Command<'s> {
     Pass(&'s str),
     Nick(&'s str),
+
+    /// user, mode, [*], real-name
     User(&'s str, &'s str, &'s str),
 
+    /// dest, message
     Privmsg(&'s str, &'s str),
 
     Quit(Option<&'s str>),
@@ -12,7 +15,7 @@ enum Command<'s> {
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-struct ParsedMessage<'b> {
+pub struct ParsedMessage<'b> {
     buf: &'b str,
     tags: Option<SubStr>,
     source: Option<SubStr>,
@@ -20,14 +23,14 @@ struct ParsedMessage<'b> {
     args: Option<SubStr>,
 }
 
-struct ParsedArgs<'b> {
+pub struct ParsedArgs<'b> {
     buf: &'b str,
     pos: usize,
 }
 
 // TODO: not sure it's clearer to have this not in terms of a generic
 // TODO: iterator, which understands the two different :-prefixed arguments
-fn parse_message(from: &str) -> Result<ParsedMessage, &'static str> {
+pub fn parse_message(from: &str) -> Result<ParsedMessage, &'static str> {
     if from.starts_with(' ') {
         return Err("whitespace start");
     }
@@ -112,7 +115,7 @@ impl<'b> ParsedMessage<'b> {
         self.args.map(|v| &self.buf[v.range()])
     }
 
-    fn args_iter(&self) -> ParsedArgs {
+    pub fn args_iter(&self) -> ParsedArgs {
         ParsedArgs {
             buf: self.args_str().unwrap_or(""),
             pos: 0,
@@ -147,7 +150,7 @@ impl<'b> ParsedMessage<'b> {
         }
     }
 
-    fn command(&self) -> Result<Command, &'static str> {
+    pub fn command(&self) -> Result<Command, &'static str> {
         let cmd = self.cmd_str();
         if cmd.eq_ignore_ascii_case("PRIVMSG") {
             match self.args() {
