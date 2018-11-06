@@ -571,14 +571,14 @@ fn wrapped<'i, I: IntoIterator<Item = &'i str>>(it: I) -> Vec<String> {
     blocks
 }
 
-fn take_messages(conn: &mut serv::Connection) -> Vec<Result<Message, ClientError>> {
-    if conn.broken_input {
-        match pop_line(&mut conn.input_buffer) {
+fn take_messages(conn: &mut serv::ConnType) -> Vec<Result<Message, ClientError>> {
+    if conn.broken_input() {
+        match pop_line(conn.input_buffer()) {
             PoppedLine::Done(_) | PoppedLine::TooLong => {
-                conn.broken_input = false;
+                conn.break_input(false);
             }
             PoppedLine::NotReady => {
-                conn.input_buffer.clear();
+                conn.input_buffer().clear();
                 return Vec::new();
             }
         }
@@ -586,21 +586,21 @@ fn take_messages(conn: &mut serv::Connection) -> Vec<Result<Message, ClientError
 
     let mut output = Vec::with_capacity(4);
     loop {
-        match line_to_message(conn.token, &mut conn.input_buffer) {
+        match line_to_message(conn.token(), conn.input_buffer()) {
             Ok(Some(message)) => output.push(Ok(message)),
             Ok(None) => break,
             Err(response) => output.push(Err(response)),
         }
     }
 
-    if conn.input_buffer.len() > 10 * INPUT_LENGTH_LIMIT {
+    if conn.input_buffer().len() > 10 * INPUT_LENGTH_LIMIT {
         output.push(Err(ClientError::ErrorReason(
             ErrorCode::LineTooLong,
             "Your input buffer is full.",
         )));
 
-        conn.broken_input = true;
-        conn.input_buffer.clear();
+        conn.break_input(true);
+        conn.input_buffer().clear();
     }
 
     output

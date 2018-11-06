@@ -36,47 +36,75 @@ impl<'a> rustls::WriteV for WriteVAdapter<'a> {
     }
 }
 
-// Token for our listening socket.
-const LISTENER: mio::Token = mio::Token(0);
+const PLAIN_LISTENER: mio::Token = mio::Token(1);
+const TLS_LISTENER: mio::Token = mio::Token(2);
 
-pub type Connections = HashMap<mio::Token, Connection>;
+pub type Connections = HashMap<mio::Token, ConnType>;
 
-/// This binds together a TCP listening socket, some outstanding
-/// connections, and a TLS server configuration.
+struct PlainServer {
+    server: TcpListener,
+}
+
 struct TlsServer {
     server: TcpListener,
-    connections: Connections,
-    next_id: usize,
     tls_config: Arc<rustls::ServerConfig>,
+}
+
+impl PlainServer {
+    fn accept(&mut self, poll: &mut mio::Poll, new_token: mio::Token) -> Result<PlainConn, Error> {
+        let (socket, addr) = self.server.accept()?;
+        debug!("Accepting new plain connection from {:?}", addr);
+
+        let conn = PlainConn {
+            socket,
+            token: new_token,
+            closed: false,
+        };
+
+        poll.register(
+            &conn.socket,
+            new_token,
+            mio::Ready::readable() | mio::Ready::writable(),
+            mio::PollOpt::level() | mio::PollOpt::oneshot(),
+        )?;
+
+        Ok(conn)
+    }
 }
 
 impl TlsServer {
     fn new(server: TcpListener, cfg: Arc<rustls::ServerConfig>) -> TlsServer {
         TlsServer {
             server,
-            connections: HashMap::new(),
-            next_id: 2,
             tls_config: cfg,
         }
     }
 
-    fn accept(&mut self, poll: &mut mio::Poll) -> Result<(), Error> {
+    fn accept(&mut self, poll: &mut mio::Poll, new_token: mio::Token) -> Result<TlsConn, Error> {
         let (socket, addr) = self.server.accept()?;
-        debug!("Accepting new connection from {:?}", addr);
+        debug!("Accepting new tls connection from {:?}", addr);
 
         let tls_session = rustls::ServerSession::new(&self.tls_config);
 
-        let token = mio::Token(self.next_id);
-        self.next_id += 1;
-        let conn = Connection::new(socket, token, tls_session);
+        let conn = TlsConn::new(socket, new_token, tls_session);
         conn.register_on_connect(poll)?;
-        self.connections.insert(token, conn);
 
-        Ok(())
+        Ok(conn)
     }
 }
 
-pub struct Connection {
+pub enum ConnType {
+    Plain(PlainConn),
+    Tls(TlsConn),
+}
+
+pub struct PlainConn {
+    socket: TcpStream,
+    pub token: mio::Token,
+    closed: bool,
+}
+
+pub struct TlsConn {
     socket: TcpStream,
     pub token: mio::Token,
     closing: bool,
@@ -88,9 +116,43 @@ pub struct Connection {
     pub broken_input: bool,
 }
 
-impl Connection {
-    fn new(socket: TcpStream, token: mio::Token, tls_session: rustls::ServerSession) -> Connection {
-        Connection {
+impl ConnType {
+    fn handle_readiness(&mut self, readiness: mio::Ready) -> Result<bool, Error> {
+        match self {
+            ConnType::Tls(tls) => tls.handle_readiness(readiness),
+            ConnType::Plain(_) => unimplemented!("plain conn is ready"),
+        }
+    }
+
+    pub fn write_line<S: AsRef<str>>(&mut self, val: S) -> Result<(), Error> {
+        unimplemented!()
+    }
+    pub fn start_closing(&mut self) {
+        unimplemented!()
+    }
+    pub fn broken_input(&self) -> bool {
+        unimplemented!()
+    }
+    pub fn break_input(&mut self, _to: bool) {
+        unimplemented!()
+    }
+    pub fn input_buffer(&mut self) -> &mut VecDeque<u8> {
+        unimplemented!()
+    }
+    pub fn token(&self) -> mio::Token {
+        unimplemented!()
+    }
+    pub fn handle_registration(&mut self, poll: &mut mio::Poll) -> Result<(), Error> {
+        unimplemented!()
+    }
+    pub fn is_closed(&self) -> bool {
+        unimplemented!()
+    }
+}
+
+impl TlsConn {
+    fn new(socket: TcpStream, token: mio::Token, tls_session: rustls::ServerSession) -> TlsConn {
+        TlsConn {
             socket,
             token,
             closing: false,
@@ -289,21 +351,14 @@ fn make_config() -> Result<rustls::ServerConfig, Error> {
 pub fn serve_forever<F: FnMut(&HashSet<Token>, &mut Connections)>(
     mut work: F,
 ) -> Result<(), Error> {
-    let addr: net::SocketAddr = "0.0.0.0:6697".parse()?;
-
-    let config = Arc::new(make_config()?);
-
-    let listener =
-        TcpListener::bind(&addr).with_context(|_| format_err!("cannot listen on port"))?;
     let mut poll = mio::Poll::new()?;
-    poll.register(
-        &listener,
-        LISTENER,
-        mio::Ready::readable(),
-        mio::PollOpt::level(),
-    )?;
 
-    let mut tlsserv = TlsServer::new(listener, config);
+    let mut plain = bind_plain(&mut poll)?;
+    let mut tlsserv = bind_tls(&mut poll)?;
+
+    let mut connections = HashMap::with_capacity(32);
+
+    let mut last_id: usize = 3;
 
     let mut events = mio::Events::with_capacity(256);
     loop {
@@ -314,9 +369,18 @@ pub fn serve_forever<F: FnMut(&HashSet<Token>, &mut Connections)>(
         // handle accepting and reading/writing data from/to active connections
         for event in events.iter() {
             match event.token() {
-                LISTENER => tlsserv.accept(&mut poll)?,
+                PLAIN_LISTENER => {
+                    last_id += 1;
+                    let token = mio::Token(last_id);
+                    connections.insert(token, ConnType::Plain(plain.accept(&mut poll, token)?));
+                }
+                TLS_LISTENER => {
+                    last_id += 1;
+                    let token = mio::Token(last_id);
+                    connections.insert(token, ConnType::Tls(tlsserv.accept(&mut poll, token)?));
+                }
                 client => {
-                    if let Some(conn) = tlsserv.connections.get_mut(&client) {
+                    if let Some(conn) = connections.get_mut(&client) {
                         if conn.handle_readiness(event.readiness())? {
                             useful_tokens.insert(client);
                         }
@@ -326,14 +390,47 @@ pub fn serve_forever<F: FnMut(&HashSet<Token>, &mut Connections)>(
         }
 
         // do useful application work on clients
-        work(&useful_tokens, &mut tlsserv.connections);
+        work(&useful_tokens, &mut connections);
 
         // check if any of the work we did means there's more networking work to do
-        for conn in tlsserv.connections.values_mut() {
+        for conn in connections.values_mut() {
             conn.handle_registration(&mut poll)?;
         }
 
         // check if anyone actually managed to die
-        tlsserv.connections.retain(|_token, conn| !conn.is_closed());
+        connections.retain(|_token, conn| !conn.is_closed());
     }
+}
+
+fn bind_plain(poll: &mut mio::Poll) -> Result<PlainServer, Error> {
+    let addr: net::SocketAddr = "0.0.0.0:6667".parse()?;
+    let listener =
+        TcpListener::bind(&addr).with_context(|_| format_err!("cannot listen on tls port"))?;
+
+    poll.register(
+        &listener,
+        PLAIN_LISTENER,
+        mio::Ready::readable(),
+        mio::PollOpt::level(),
+    )?;
+
+    Ok(PlainServer { server: listener })
+}
+
+fn bind_tls(poll: &mut mio::Poll) -> Result<TlsServer, Error> {
+    let addr: net::SocketAddr = "0.0.0.0:6697".parse()?;
+
+    let config = Arc::new(make_config()?);
+
+    let listener =
+        TcpListener::bind(&addr).with_context(|_| format_err!("cannot listen on tls port"))?;
+
+    poll.register(
+        &listener,
+        TLS_LISTENER,
+        mio::Ready::readable(),
+        mio::PollOpt::level(),
+    )?;
+
+    Ok(TlsServer::new(listener, config))
 }
