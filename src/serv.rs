@@ -39,7 +39,7 @@ impl<'a> rustls::WriteV for WriteVAdapter<'a> {
 const PLAIN_LISTENER: mio::Token = mio::Token(1);
 const TLS_LISTENER: mio::Token = mio::Token(2);
 
-pub type Connections = HashMap<mio::Token, ConnType>;
+pub type Connections = HashMap<mio::Token, Conn>;
 
 struct PlainServer {
     server: TcpListener,
@@ -51,11 +51,11 @@ struct TlsServer {
 }
 
 impl PlainServer {
-    fn accept(&mut self, poll: &mut mio::Poll, new_token: mio::Token) -> Result<PlainConn, Error> {
+    fn accept(&mut self, poll: &mut mio::Poll, new_token: mio::Token) -> Result<Conn, Error> {
         let (socket, addr) = self.server.accept()?;
         debug!("Accepting new plain connection from {:?}", addr);
 
-        let conn = PlainConn {
+        let conn = Conn {
             net: NetConn {
                 socket,
                 token: new_token,
@@ -63,6 +63,7 @@ impl PlainServer {
                 closed: false,
             },
             input: InputBuffer::default(),
+            extra: ConnType::Plain,
         };
 
         poll.register(
@@ -84,22 +85,34 @@ impl TlsServer {
         }
     }
 
-    fn accept(&mut self, poll: &mut mio::Poll, new_token: mio::Token) -> Result<TlsConn, Error> {
+    fn accept(&mut self, poll: &mut mio::Poll, new_token: mio::Token) -> Result<Conn, Error> {
         let (socket, addr) = self.server.accept()?;
         debug!("Accepting new tls connection from {:?}", addr);
 
-        let tls_session = rustls::ServerSession::new(&self.tls_config);
+        let mut tls_session = rustls::ServerSession::new(&self.tls_config);
 
-        let conn = TlsConn::new(socket, new_token, tls_session);
-        conn.register_on_connect(poll)?;
+        let mut net = NetConn {
+            socket,
+            token: new_token,
+            closing: false,
+            closed: false,
+        };
+
+        register_on_connect(&mut net, poll, event_set(&mut tls_session))?;
+
+        let conn = Conn {
+            net,
+            input: InputBuffer::default(),
+            extra: ConnType::Tls(tls_session),
+        };
 
         Ok(conn)
     }
 }
 
 pub enum ConnType {
-    Plain(PlainConn),
-    Tls(TlsConn),
+    Plain,
+    Tls(rustls::ServerSession),
 }
 
 pub struct NetConn {
@@ -117,227 +130,206 @@ pub struct InputBuffer {
     broken: bool,
 }
 
-pub struct PlainConn {
+pub struct Conn {
     net: NetConn,
     input: InputBuffer,
+    extra: ConnType,
 }
 
-pub struct TlsConn {
-    net: NetConn,
-    input: InputBuffer,
-
-    tls_session: rustls::ServerSession,
-}
-
-impl ConnType {
-    fn net(&mut self) -> &mut NetConn {
-        match self {
-            ConnType::Plain(plain) => &mut plain.net,
-            ConnType::Tls(tls) => &mut tls.net,
-        }
-    }
-
-    fn input(&mut self) -> &mut InputBuffer {
-        match self {
-            ConnType::Plain(plain) => &mut plain.input,
-            ConnType::Tls(tls) => &mut tls.input,
-        }
-    }
+impl Conn {
     fn handle_readiness(&mut self, readiness: mio::Ready) -> Result<bool, Error> {
-        match self {
-            ConnType::Tls(tls) => tls.handle_readiness(readiness),
-            ConnType::Plain(_) => unimplemented!("plain conn is ready"),
+        match &mut self.extra {
+            ConnType::Tls(tls) => handle_readiness(&mut self.net, &mut self.input, tls, readiness),
+            ConnType::Plain => unimplemented!("plain conn is ready"),
         }
     }
 
     pub fn handle_registration(&mut self, poll: &mut mio::Poll) -> Result<(), Error> {
-        match self {
-            ConnType::Tls(tls) => tls.handle_registration(poll),
-            ConnType::Plain(_) => unimplemented!("plain conn handle registration"),
+        match &mut self.extra {
+            ConnType::Tls(tls) => handle_registration(&mut self.net, poll, tls),
+            ConnType::Plain => unimplemented!("plain conn handle registration"),
         }
     }
 
     pub fn write_line<S: AsRef<str>>(&mut self, val: S) -> Result<(), Error> {
-        match self {
-            ConnType::Plain(_) => unimplemented!("plain conn write_line"),
-            ConnType::Tls(tls) => tls.write_line(val),
+        match &mut self.extra {
+            ConnType::Plain => unimplemented!("plain conn write_line"),
+            ConnType::Tls(tls) => write_line(&mut self.net, tls, val),
         }
-    }
-
-    pub fn start_closing(&mut self) {
-        self.net().closing = true;
-    }
-
-    pub fn is_closed(&mut self) -> bool {
-        self.net().closed
-    }
-
-    pub fn broken_input(&mut self) -> bool {
-        self.input().broken
-    }
-
-    pub fn break_input(&mut self, to: bool) {
-        self.input().broken = to;
-    }
-
-    pub fn input_buffer(&mut self) -> &mut VecDeque<u8> {
-        &mut self.input().buf
-    }
-
-    pub fn token(&mut self) -> mio::Token {
-        self.net().token
-    }
-}
-
-impl TlsConn {
-    fn new(socket: TcpStream, token: mio::Token, tls_session: rustls::ServerSession) -> TlsConn {
-        TlsConn {
-            net: NetConn {
-                socket,
-                token,
-                closing: false,
-                closed: false,
-            },
-            tls_session,
-            input: InputBuffer::default(),
-        }
-    }
-
-    /// We're a connection, and we have something to do.
-    /// @return true if we generated some new input to process
-    fn handle_readiness(&mut self, readiness: mio::Ready) -> Result<bool, Error> {
-        // If we're readable: read some TLS. Then see if that yielded new plaintext.
-        let mut new_input = false;
-
-        if readiness.is_readable() {
-            self.do_tls_read();
-            new_input |= self.try_plain_read()?;
-        }
-
-        if readiness.is_writable() {
-            self.do_tls_write();
-        }
-
-        Ok(new_input)
-    }
-
-    fn handle_registration(&mut self, poll: &mut mio::Poll) -> Result<(), Error> {
-        if self.net.closing && !self.tls_session.wants_write() {
-            let _ = self.net.socket.shutdown(Shutdown::Both);
-            self.net.closed = true;
-        } else {
-            self.reregister(poll)?;
-        }
-
-        Ok(())
-    }
-
-    fn do_tls_read(&mut self) {
-        // Read some TLS data.
-        match self.tls_session.read_tls(&mut self.net.socket) {
-            Ok(0) => {
-                debug!("eof");
-                self.net.closing = true;
-            }
-
-            Err(ref e) if io::ErrorKind::WouldBlock == e.kind() => (),
-
-            Err(e) => {
-                error!("read error {:?}", e);
-                self.net.closing = true;
-            }
-
-            Ok(_) => {
-                if let Err(e) = self.tls_session.process_new_packets() {
-                    error!("cannot process packet: {:?}", e);
-                    self.net.closing = true;
-                }
-            }
-        }
-    }
-
-    /// @return true if some new data is available
-    fn try_plain_read(&mut self) -> Result<bool, Error> {
-        // Read and process all available plaintext.
-        let mut buf = Vec::new();
-
-        Ok(match self.tls_session.read_to_end(&mut buf) {
-            Ok(0) => false,
-            Ok(_) => {
-                debug!("plaintext read {:?}", buf.len());
-                self.input.buf.extend(buf);
-                true
-            }
-            Err(e) => {
-                error!("plaintext read failed: {:?}", e);
-                self.net.closing = true;
-                false
-            }
-        })
-    }
-
-    fn do_tls_write(&mut self) {
-        let rc = self
-            .tls_session
-            .writev_tls(&mut WriteVAdapter::new(&mut self.net.socket));
-        if rc.is_err() {
-            error!("write failed {:?}", rc);
-            self.net.closing = true;
-            return;
-        }
-    }
-
-    fn register_on_connect(&self, poll: &mut mio::Poll) -> Result<(), Error> {
-        Ok(poll.register(
-            &self.net.socket,
-            self.net.token,
-            self.event_set(),
-            mio::PollOpt::level() | mio::PollOpt::oneshot(),
-        )?)
-    }
-
-    fn reregister(&self, poll: &mut mio::Poll) -> Result<(), Error> {
-        Ok(poll.reregister(
-            &self.net.socket,
-            self.net.token,
-            self.event_set(),
-            mio::PollOpt::level() | mio::PollOpt::oneshot(),
-        )?)
-    }
-
-    /// What IO events we're currently waiting for,
-    /// based on wants_read/wants_write.
-    fn event_set(&self) -> mio::Ready {
-        let rd = self.tls_session.wants_read();
-        let wr = self.tls_session.wants_write();
-
-        if rd && wr {
-            mio::Ready::readable() | mio::Ready::writable()
-        } else if wr {
-            mio::Ready::writable()
-        } else {
-            mio::Ready::readable()
-        }
-    }
-
-    fn is_closed(&self) -> bool {
-        self.net.closed
     }
 
     pub fn start_closing(&mut self) {
         if !self.net.closing {
-            self.tls_session.send_close_notify();
+            if let ConnType::Tls(tls) = &mut self.extra {
+                tls.send_close_notify();
+            }
             self.net.closing = true;
         }
     }
 
-    pub fn write_line<S: AsRef<str>>(&mut self, val: S) -> Result<(), Error> {
-        let val = val.as_ref();
-        trace!("output: {:?}: {:?})", self.net.token, val);
-        self.tls_session.write_all(val.as_bytes())?;
-        self.tls_session.write_all(b"\r\n")?;
-        Ok(())
+    pub fn is_closed(&self) -> bool {
+        self.net.closed
     }
+
+    pub fn broken_input(&mut self) -> bool {
+        self.input.broken
+    }
+
+    pub fn break_input(&mut self, to: bool) {
+        self.input.broken = to;
+    }
+
+    pub fn input_buffer(&mut self) -> &mut VecDeque<u8> {
+        &mut self.input.buf
+    }
+
+    pub fn token(&mut self) -> mio::Token {
+        self.net.token
+    }
+}
+
+/// We're a connection, and we have something to do.
+/// @return true if we generated some new input to process
+fn handle_readiness(
+    net: &mut NetConn,
+    input: &mut InputBuffer,
+    tls_session: &mut rustls::ServerSession,
+    readiness: mio::Ready,
+) -> Result<bool, Error> {
+    // If we're readable: read some TLS. Then see if that yielded new plaintext.
+    let mut new_input = false;
+
+    if readiness.is_readable() {
+        do_tls_read(net, tls_session);
+        new_input |= try_plain_read(net, input, tls_session)?;
+    }
+
+    if readiness.is_writable() {
+        do_tls_write(net, tls_session);
+    }
+
+    Ok(new_input)
+}
+
+fn handle_registration(
+    net: &mut NetConn,
+    poll: &mut mio::Poll,
+    tls_session: &mut rustls::ServerSession,
+) -> Result<(), Error> {
+    if net.closing && !tls_session.wants_write() {
+        let _ = net.socket.shutdown(Shutdown::Both);
+        net.closed = true;
+    } else {
+        reregister(net, poll, event_set(tls_session))?;
+    }
+
+    Ok(())
+}
+
+fn do_tls_read(net: &mut NetConn, tls_session: &mut rustls::ServerSession) {
+    // Read some TLS data.
+    match tls_session.read_tls(&mut net.socket) {
+        Ok(0) => {
+            debug!("eof");
+            net.closing = true;
+        }
+
+        Err(ref e) if io::ErrorKind::WouldBlock == e.kind() => (),
+
+        Err(e) => {
+            error!("read error {:?}", e);
+            net.closing = true;
+        }
+
+        Ok(_) => {
+            if let Err(e) = tls_session.process_new_packets() {
+                error!("cannot process packet: {:?}", e);
+                net.closing = true;
+            }
+        }
+    }
+}
+
+/// @return true if some new data is available
+fn try_plain_read(
+    net: &mut NetConn,
+    input: &mut InputBuffer,
+    tls_session: &mut rustls::ServerSession,
+) -> Result<bool, Error> {
+    // Read and process all available plaintext.
+    let mut buf = Vec::new();
+
+    Ok(match tls_session.read_to_end(&mut buf) {
+        Ok(0) => false,
+        Ok(_) => {
+            debug!("plaintext read {:?}", buf.len());
+            input.buf.extend(buf);
+            true
+        }
+        Err(e) => {
+            error!("plaintext read failed: {:?}", e);
+            net.closing = true;
+            false
+        }
+    })
+}
+
+fn do_tls_write(net: &mut NetConn, tls_session: &mut rustls::ServerSession) {
+    let rc = tls_session.writev_tls(&mut WriteVAdapter::new(&mut net.socket));
+    if rc.is_err() {
+        error!("write failed {:?}", rc);
+        net.closing = true;
+        return;
+    }
+}
+
+fn register_on_connect(
+    net: &mut NetConn,
+    poll: &mut mio::Poll,
+    interest: mio::Ready,
+) -> Result<(), Error> {
+    Ok(poll.register(
+        &net.socket,
+        net.token,
+        interest,
+        mio::PollOpt::level() | mio::PollOpt::oneshot(),
+    )?)
+}
+
+fn reregister(net: &mut NetConn, poll: &mut mio::Poll, interest: mio::Ready) -> Result<(), Error> {
+    Ok(poll.reregister(
+        &net.socket,
+        net.token,
+        interest,
+        mio::PollOpt::level() | mio::PollOpt::oneshot(),
+    )?)
+}
+
+/// What IO events we're currently waiting for,
+/// based on wants_read/wants_write.
+fn event_set(tls_session: &mut rustls::ServerSession) -> mio::Ready {
+    let rd = tls_session.wants_read();
+    let wr = tls_session.wants_write();
+
+    if rd && wr {
+        mio::Ready::readable() | mio::Ready::writable()
+    } else if wr {
+        mio::Ready::writable()
+    } else {
+        mio::Ready::readable()
+    }
+}
+
+pub fn write_line<S: AsRef<str>>(
+    net: &mut NetConn,
+    tls_session: &mut rustls::ServerSession,
+    val: S,
+) -> Result<(), Error> {
+    let val = val.as_ref();
+    trace!("output: {:?}: {:?})", net.token, val);
+    tls_session.write_all(val.as_bytes())?;
+    tls_session.write_all(b"\r\n")?;
+    Ok(())
 }
 
 fn load_certs(filename: &str) -> Result<Vec<rustls::Certificate>, Error> {
@@ -412,12 +404,12 @@ pub fn serve_forever<F: FnMut(&HashSet<Token>, &mut Connections)>(
                 PLAIN_LISTENER => {
                     last_id += 1;
                     let token = mio::Token(last_id);
-                    connections.insert(token, ConnType::Plain(plain.accept(&mut poll, token)?));
+                    connections.insert(token, plain.accept(&mut poll, token)?);
                 }
                 TLS_LISTENER => {
                     last_id += 1;
                     let token = mio::Token(last_id);
-                    connections.insert(token, ConnType::Tls(tlsserv.accept(&mut poll, token)?));
+                    connections.insert(token, tlsserv.accept(&mut poll, token)?);
                 }
                 client => {
                     if let Some(conn) = connections.get_mut(&client) {

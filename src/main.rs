@@ -571,7 +571,7 @@ fn wrapped<'i, I: IntoIterator<Item = &'i str>>(it: I) -> Vec<String> {
     blocks
 }
 
-fn take_messages(conn: &mut serv::ConnType) -> Vec<Result<Message, ClientError>> {
+fn take_messages(conn: &mut serv::Conn) -> Vec<Result<Message, ClientError>> {
     if conn.broken_input() {
         match pop_line(conn.input_buffer()) {
             PoppedLine::Done(_) | PoppedLine::TooLong => {
