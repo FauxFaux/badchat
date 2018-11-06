@@ -101,7 +101,7 @@ impl TlsServer {
         poll.register(
             &net.socket,
             net.token,
-            event_set(&mut tls_session),
+            mio::Ready::readable() | mio::Ready::writable(),
             mio::PollOpt::level() | mio::PollOpt::oneshot(),
         )?;
 
@@ -146,6 +146,7 @@ impl Conn {
     /// @return true if we generated some new input to process
     fn handle_readiness(&mut self, readiness: mio::Ready) -> Result<bool, Error> {
         match &mut self.extra {
+            ConnType::Plain => unimplemented!("plain conn is ready"),
             ConnType::Tls(tls) => {
                 // If we're readable: read some TLS. Then see if that yielded new plaintext.
                 let mut new_input = false;
@@ -161,27 +162,26 @@ impl Conn {
 
                 Ok(new_input)
             }
-            ConnType::Plain => unimplemented!("plain conn is ready"),
         }
     }
 
     pub fn handle_registration(&mut self, poll: &mut mio::Poll) -> Result<(), Error> {
-        match &mut self.extra {
-            ConnType::Plain => unimplemented!("plain conn handle registration"),
-            ConnType::Tls(tls) => {
-                if self.net.closing && !tls.wants_write() {
-                    let _ = self.net.socket.shutdown(Shutdown::Both);
-                    self.net.closed = true;
-                } else {
-                    poll.reregister(
-                        &self.net.socket,
-                        self.net.token,
-                        event_set(tls),
-                        mio::PollOpt::level() | mio::PollOpt::oneshot(),
-                    )?;
-                }
-            }
+        if self.net.closing
+            && match &mut self.extra {
+                ConnType::Plain => unimplemented!("plain conn handle registration"),
+                ConnType::Tls(tls) => !tls.wants_write(),
+            } {
+            let _ = self.net.socket.shutdown(Shutdown::Both);
+            self.net.closed = true;
+            return Ok(());
         }
+
+        poll.reregister(
+            &self.net.socket,
+            self.net.token,
+            self.event_set(),
+            mio::PollOpt::level() | mio::PollOpt::oneshot(),
+        )?;
         Ok(())
     }
 
@@ -204,6 +204,21 @@ impl Conn {
                 tls.send_close_notify();
             }
             self.net.closing = true;
+        }
+    }
+
+    pub fn event_set(&self) -> mio::Ready {
+        let (rd, wr) = match &self.extra {
+            ConnType::Plain => (true, true),
+            ConnType::Tls(tls) => (tls.wants_read(), tls.wants_write()),
+        };
+
+        if rd && wr {
+            mio::Ready::readable() | mio::Ready::writable()
+        } else if wr {
+            mio::Ready::writable()
+        } else {
+            mio::Ready::readable()
         }
     }
 }
@@ -262,21 +277,6 @@ fn do_tls_write(net: &mut NetConn, tls_session: &mut rustls::ServerSession) {
         error!("write failed {:?}", rc);
         net.closing = true;
         return;
-    }
-}
-
-/// What IO events we're currently waiting for,
-/// based on wants_read/wants_write.
-fn event_set(tls_session: &mut rustls::ServerSession) -> mio::Ready {
-    let rd = tls_session.wants_read();
-    let wr = tls_session.wants_write();
-
-    if rd && wr {
-        mio::Ready::readable() | mio::Ready::writable()
-    } else if wr {
-        mio::Ready::writable()
-    } else {
-        mio::Ready::readable()
     }
 }
 
