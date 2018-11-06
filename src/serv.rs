@@ -98,7 +98,12 @@ impl TlsServer {
             closed: false,
         };
 
-        register_on_connect(&mut net, poll, event_set(&mut tls_session))?;
+        poll.register(
+            &net.socket,
+            net.token,
+            event_set(&mut tls_session),
+            mio::PollOpt::level() | mio::PollOpt::oneshot(),
+        )?;
 
         let conn = Conn {
             net,
@@ -117,45 +122,80 @@ pub enum ConnType {
 
 pub struct NetConn {
     socket: TcpStream,
-    token: mio::Token,
+    pub token: mio::Token,
     closing: bool,
     closed: bool,
 }
 
 #[derive(Clone, Default)]
 pub struct InputBuffer {
-    buf: VecDeque<u8>,
+    pub buf: VecDeque<u8>,
 
     /// The client angered us. We are discarding until they send us a line break.
-    broken: bool,
+    pub broken: bool,
 }
 
 pub struct Conn {
-    net: NetConn,
-    input: InputBuffer,
+    pub net: NetConn,
+    pub input: InputBuffer,
     extra: ConnType,
 }
 
 impl Conn {
+    /// We're a connection, and we have something to do.
+    /// @return true if we generated some new input to process
     fn handle_readiness(&mut self, readiness: mio::Ready) -> Result<bool, Error> {
         match &mut self.extra {
-            ConnType::Tls(tls) => handle_readiness(&mut self.net, &mut self.input, tls, readiness),
+            ConnType::Tls(tls) => {
+                // If we're readable: read some TLS. Then see if that yielded new plaintext.
+                let mut new_input = false;
+
+                if readiness.is_readable() {
+                    do_tls_read(&mut self.net, tls);
+                    new_input |= try_plain_read(&mut self.net, &mut self.input, tls)?;
+                }
+
+                if readiness.is_writable() {
+                    do_tls_write(&mut self.net, tls);
+                }
+
+                Ok(new_input)
+            }
             ConnType::Plain => unimplemented!("plain conn is ready"),
         }
     }
 
     pub fn handle_registration(&mut self, poll: &mut mio::Poll) -> Result<(), Error> {
         match &mut self.extra {
-            ConnType::Tls(tls) => handle_registration(&mut self.net, poll, tls),
             ConnType::Plain => unimplemented!("plain conn handle registration"),
+            ConnType::Tls(tls) => {
+                if self.net.closing && !tls.wants_write() {
+                    let _ = self.net.socket.shutdown(Shutdown::Both);
+                    self.net.closed = true;
+                } else {
+                    poll.reregister(
+                        &self.net.socket,
+                        self.net.token,
+                        event_set(tls),
+                        mio::PollOpt::level() | mio::PollOpt::oneshot(),
+                    )?;
+                }
+            }
         }
+        Ok(())
     }
 
     pub fn write_line<S: AsRef<str>>(&mut self, val: S) -> Result<(), Error> {
+        let val = val.as_ref();
         match &mut self.extra {
             ConnType::Plain => unimplemented!("plain conn write_line"),
-            ConnType::Tls(tls) => write_line(&mut self.net, tls, val),
+            ConnType::Tls(tls) => {
+                trace!("output: {:?}: {:?})", self.net.token, val);
+                tls.write_all(val.as_bytes())?;
+                tls.write_all(b"\r\n")?;
+            }
         }
+        Ok(())
     }
 
     pub fn start_closing(&mut self) {
@@ -166,64 +206,6 @@ impl Conn {
             self.net.closing = true;
         }
     }
-
-    pub fn is_closed(&self) -> bool {
-        self.net.closed
-    }
-
-    pub fn broken_input(&mut self) -> bool {
-        self.input.broken
-    }
-
-    pub fn break_input(&mut self, to: bool) {
-        self.input.broken = to;
-    }
-
-    pub fn input_buffer(&mut self) -> &mut VecDeque<u8> {
-        &mut self.input.buf
-    }
-
-    pub fn token(&mut self) -> mio::Token {
-        self.net.token
-    }
-}
-
-/// We're a connection, and we have something to do.
-/// @return true if we generated some new input to process
-fn handle_readiness(
-    net: &mut NetConn,
-    input: &mut InputBuffer,
-    tls_session: &mut rustls::ServerSession,
-    readiness: mio::Ready,
-) -> Result<bool, Error> {
-    // If we're readable: read some TLS. Then see if that yielded new plaintext.
-    let mut new_input = false;
-
-    if readiness.is_readable() {
-        do_tls_read(net, tls_session);
-        new_input |= try_plain_read(net, input, tls_session)?;
-    }
-
-    if readiness.is_writable() {
-        do_tls_write(net, tls_session);
-    }
-
-    Ok(new_input)
-}
-
-fn handle_registration(
-    net: &mut NetConn,
-    poll: &mut mio::Poll,
-    tls_session: &mut rustls::ServerSession,
-) -> Result<(), Error> {
-    if net.closing && !tls_session.wants_write() {
-        let _ = net.socket.shutdown(Shutdown::Both);
-        net.closed = true;
-    } else {
-        reregister(net, poll, event_set(tls_session))?;
-    }
-
-    Ok(())
 }
 
 fn do_tls_read(net: &mut NetConn, tls_session: &mut rustls::ServerSession) {
@@ -283,28 +265,6 @@ fn do_tls_write(net: &mut NetConn, tls_session: &mut rustls::ServerSession) {
     }
 }
 
-fn register_on_connect(
-    net: &mut NetConn,
-    poll: &mut mio::Poll,
-    interest: mio::Ready,
-) -> Result<(), Error> {
-    Ok(poll.register(
-        &net.socket,
-        net.token,
-        interest,
-        mio::PollOpt::level() | mio::PollOpt::oneshot(),
-    )?)
-}
-
-fn reregister(net: &mut NetConn, poll: &mut mio::Poll, interest: mio::Ready) -> Result<(), Error> {
-    Ok(poll.reregister(
-        &net.socket,
-        net.token,
-        interest,
-        mio::PollOpt::level() | mio::PollOpt::oneshot(),
-    )?)
-}
-
 /// What IO events we're currently waiting for,
 /// based on wants_read/wants_write.
 fn event_set(tls_session: &mut rustls::ServerSession) -> mio::Ready {
@@ -318,18 +278,6 @@ fn event_set(tls_session: &mut rustls::ServerSession) -> mio::Ready {
     } else {
         mio::Ready::readable()
     }
-}
-
-pub fn write_line<S: AsRef<str>>(
-    net: &mut NetConn,
-    tls_session: &mut rustls::ServerSession,
-    val: S,
-) -> Result<(), Error> {
-    let val = val.as_ref();
-    trace!("output: {:?}: {:?})", net.token, val);
-    tls_session.write_all(val.as_bytes())?;
-    tls_session.write_all(b"\r\n")?;
-    Ok(())
 }
 
 fn load_certs(filename: &str) -> Result<Vec<rustls::Certificate>, Error> {
@@ -430,7 +378,7 @@ pub fn serve_forever<F: FnMut(&HashSet<Token>, &mut Connections)>(
         }
 
         // check if anyone actually managed to die
-        connections.retain(|_token, conn| !conn.is_closed());
+        connections.retain(|_token, conn| !conn.net.closed);
     }
 }
 
