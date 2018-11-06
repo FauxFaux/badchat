@@ -147,19 +147,30 @@ impl Conn {
     fn handle_readiness(&mut self, readiness: mio::Ready) -> Result<bool, Error> {
         let mut new_input = false;
 
+        trace!("woke up for {:?} {:?}", self.net.token, readiness);
+
         match &mut self.extra {
             ConnType::Plain(output) => {
-                // TODO: I literally made this code up, presumably it has to handle errors
                 if readiness.is_readable() {
-                    let mut buf = Vec::new();
-                    self.net.socket.read_to_end(&mut buf)?;
-                    self.input.buf.extend(buf);
+                    let mut buf = [0u8; 4096];
+
+                    // TODO: if the wakeup was a lie, presumably this can return WouldBlock
+                    let read = self.net.socket.read(&mut buf)?;
+                    if 0 == read {
+                        // EOF!
+                        trace!("eof");
+                        self.net.closing = true;
+                    } else {
+                        self.input.buf.extend(&buf[..read]);
+                    }
                 }
 
                 if readiness.is_writable() {
                     let (first, then) = output.as_slices();
+                    // TODO: presumably this can at least theoretically block
                     self.net.socket.write_all(first)?;
                     self.net.socket.write_all(then)?;
+                    output.clear();
                 }
             }
             ConnType::Tls(tls) => {
@@ -181,7 +192,7 @@ impl Conn {
     pub fn handle_registration(&mut self, poll: &mut mio::Poll) -> Result<(), Error> {
         if self.net.closing
             && match &mut self.extra {
-                ConnType::Plain(output) => !output.is_empty(),
+                ConnType::Plain(output) => output.is_empty(),
                 ConnType::Tls(tls) => !tls.wants_write(),
             } {
             let _ = self.net.socket.shutdown(Shutdown::Both);
