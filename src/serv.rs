@@ -63,7 +63,7 @@ impl PlainServer {
                 closed: false,
             },
             input: InputBuffer::default(),
-            extra: ConnType::Plain,
+            extra: ConnType::Plain(VecDeque::new()),
         };
 
         poll.register(
@@ -116,7 +116,7 @@ impl TlsServer {
 }
 
 pub enum ConnType {
-    Plain,
+    Plain(VecDeque<u8>),
     Tls(rustls::ServerSession),
 }
 
@@ -145,11 +145,25 @@ impl Conn {
     /// We're a connection, and we have something to do.
     /// @return true if we generated some new input to process
     fn handle_readiness(&mut self, readiness: mio::Ready) -> Result<bool, Error> {
+        let mut new_input = false;
+
         match &mut self.extra {
-            ConnType::Plain => unimplemented!("plain conn is ready"),
+            ConnType::Plain(output) => {
+                // TODO: I literally made this code up, presumably it has to handle errors
+                if readiness.is_readable() {
+                    let mut buf = Vec::new();
+                    self.net.socket.read_to_end(&mut buf)?;
+                    self.input.buf.extend(buf);
+                }
+
+                if readiness.is_writable() {
+                    let (first, then) = output.as_slices();
+                    self.net.socket.write_all(first)?;
+                    self.net.socket.write_all(then)?;
+                }
+            }
             ConnType::Tls(tls) => {
                 // If we're readable: read some TLS. Then see if that yielded new plaintext.
-                let mut new_input = false;
 
                 if readiness.is_readable() {
                     do_tls_read(&mut self.net, tls);
@@ -159,16 +173,15 @@ impl Conn {
                 if readiness.is_writable() {
                     do_tls_write(&mut self.net, tls);
                 }
-
-                Ok(new_input)
             }
         }
+        Ok(new_input)
     }
 
     pub fn handle_registration(&mut self, poll: &mut mio::Poll) -> Result<(), Error> {
         if self.net.closing
             && match &mut self.extra {
-                ConnType::Plain => unimplemented!("plain conn handle registration"),
+                ConnType::Plain(output) => !output.is_empty(),
                 ConnType::Tls(tls) => !tls.wants_write(),
             } {
             let _ = self.net.socket.shutdown(Shutdown::Both);
@@ -187,10 +200,13 @@ impl Conn {
 
     pub fn write_line<S: AsRef<str>>(&mut self, val: S) -> Result<(), Error> {
         let val = val.as_ref();
+        trace!("output: {:?}: {:?})", self.net.token, val);
         match &mut self.extra {
-            ConnType::Plain => unimplemented!("plain conn write_line"),
+            ConnType::Plain(output) => {
+                output.extend(val.as_bytes());
+                output.extend(b"\r\n");
+            }
             ConnType::Tls(tls) => {
-                trace!("output: {:?}: {:?})", self.net.token, val);
                 tls.write_all(val.as_bytes())?;
                 tls.write_all(b"\r\n")?;
             }
@@ -209,7 +225,7 @@ impl Conn {
 
     pub fn event_set(&self) -> mio::Ready {
         let (rd, wr) = match &self.extra {
-            ConnType::Plain => (true, true),
+            ConnType::Plain(output) => (true, !output.is_empty()),
             ConnType::Tls(tls) => (tls.wants_read(), tls.wants_write()),
         };
 
