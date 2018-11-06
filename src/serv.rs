@@ -147,7 +147,7 @@ impl Conn {
     fn handle_readiness(&mut self, readiness: mio::Ready) -> Result<bool, Error> {
         let mut new_input = false;
 
-        trace!("woke up for {:?} {:?}", self.net.token, readiness);
+        trace!("{:?} woke up: {:?}", self.net.token, readiness);
 
         match &mut self.extra {
             ConnType::Plain(output) => {
@@ -158,9 +158,9 @@ impl Conn {
                     let read = self.net.socket.read(&mut buf)?;
                     if 0 == read {
                         // EOF!
-                        trace!("eof");
                         self.net.closing = true;
                     } else {
+                        new_input = true;
                         self.input.buf.extend(&buf[..read]);
                     }
                 }
