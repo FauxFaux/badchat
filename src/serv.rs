@@ -404,21 +404,17 @@ pub fn serve_forever<F: FnMut(&HashSet<Token>, &mut Connections)>(
 
         // handle accepting and reading/writing data from/to active connections
         for event in events.iter() {
-            match event.token() {
-                server => {
-                    if let Some(server) = servers.get_mut(&server) {
-                        last_id += 1;
-                        let token = mio::Token(last_id);
-                        connections.insert(token, server.accept(&mut poll, token)?);
-                    }
+            let token = event.token();
+            if let Some(server) = servers.get_mut(&token) {
+                last_id += 1;
+                let token = mio::Token(last_id);
+                connections.insert(token, server.accept(&mut poll, token)?);
+            } else if let Some(conn) = connections.get_mut(&token) {
+                if conn.handle_readiness(event.readiness())? {
+                    useful_tokens.insert(token);
                 }
-                client => {
-                    if let Some(conn) = connections.get_mut(&client) {
-                        if conn.handle_readiness(event.readiness())? {
-                            useful_tokens.insert(client);
-                        }
-                    }
-                }
+            } else {
+                error!("saw a token that wasn't tracked: {:?}", token)
             }
         }
 
