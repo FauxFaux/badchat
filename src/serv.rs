@@ -41,6 +41,11 @@ const TLS_LISTENER: mio::Token = mio::Token(2);
 
 pub type Connections = HashMap<mio::Token, Conn>;
 
+enum Server {
+    Plain(PlainServer),
+    Tls(TlsServer),
+}
+
 struct PlainServer {
     server: TcpListener,
 }
@@ -48,6 +53,15 @@ struct PlainServer {
 struct TlsServer {
     server: TcpListener,
     tls_config: Arc<rustls::ServerConfig>,
+}
+
+impl Server {
+    fn accept(&mut self, poll: &mut mio::Poll, new_token: mio::Token) -> Result<Conn, Error> {
+        match self {
+            Server::Plain(server) => server.accept(poll, new_token),
+            Server::Tls(server) => server.accept(poll, new_token),
+        }
+    }
 }
 
 impl PlainServer {
@@ -359,13 +373,28 @@ pub fn serve_forever<F: FnMut(&HashSet<Token>, &mut Connections)>(
     mut work: F,
 ) -> Result<(), Error> {
     let mut poll = mio::Poll::new()?;
+    let mut last_id: usize = 0;
 
-    let mut plain = bind_plain(&mut poll)?;
-    let mut tlsserv = bind_tls(&mut poll)?;
+    let mut servers = HashMap::with_capacity(4);
+
+    let tls_config = Arc::new(make_config()?);
+
+    for (addr, ssl) in &[("[::]:6667", false), ("[::]:6697", true)] {
+        let token = mio::Token(last_id);
+        last_id += 1;
+
+        let server = bind(&mut poll, addr.parse()?, token)?;
+
+        let server = if *ssl {
+            Server::Tls(TlsServer::new(server, tls_config.clone()))
+        } else {
+            Server::Plain(PlainServer { server })
+        };
+
+        servers.insert(token, server);
+    }
 
     let mut connections = HashMap::with_capacity(32);
-
-    let mut last_id: usize = 3;
 
     let mut events = mio::Events::with_capacity(256);
     loop {
@@ -376,15 +405,12 @@ pub fn serve_forever<F: FnMut(&HashSet<Token>, &mut Connections)>(
         // handle accepting and reading/writing data from/to active connections
         for event in events.iter() {
             match event.token() {
-                PLAIN_LISTENER => {
-                    last_id += 1;
-                    let token = mio::Token(last_id);
-                    connections.insert(token, plain.accept(&mut poll, token)?);
-                }
-                TLS_LISTENER => {
-                    last_id += 1;
-                    let token = mio::Token(last_id);
-                    connections.insert(token, tlsserv.accept(&mut poll, token)?);
+                server => {
+                    if let Some(server) = servers.get_mut(&server) {
+                        last_id += 1;
+                        let token = mio::Token(last_id);
+                        connections.insert(token, server.accept(&mut poll, token)?);
+                    }
                 }
                 client => {
                     if let Some(conn) = connections.get_mut(&client) {
@@ -409,8 +435,11 @@ pub fn serve_forever<F: FnMut(&HashSet<Token>, &mut Connections)>(
     }
 }
 
-fn bind_plain(poll: &mut mio::Poll) -> Result<PlainServer, Error> {
-    let addr: net::SocketAddr = "0.0.0.0:6667".parse()?;
+fn bind(
+    poll: &mut mio::Poll,
+    addr: net::SocketAddr,
+    token: mio::Token,
+) -> Result<TcpListener, Error> {
     let listener =
         TcpListener::bind(&addr).with_context(|_| format_err!("cannot listen on tls port"))?;
 
@@ -421,23 +450,5 @@ fn bind_plain(poll: &mut mio::Poll) -> Result<PlainServer, Error> {
         mio::PollOpt::level(),
     )?;
 
-    Ok(PlainServer { server: listener })
-}
-
-fn bind_tls(poll: &mut mio::Poll) -> Result<TlsServer, Error> {
-    let addr: net::SocketAddr = "0.0.0.0:6697".parse()?;
-
-    let config = Arc::new(make_config()?);
-
-    let listener =
-        TcpListener::bind(&addr).with_context(|_| format_err!("cannot listen on tls port"))?;
-
-    poll.register(
-        &listener,
-        TLS_LISTENER,
-        mio::Ready::readable(),
-        mio::PollOpt::level(),
-    )?;
-
-    Ok(TlsServer::new(listener, config))
+    Ok(listener)
 }
