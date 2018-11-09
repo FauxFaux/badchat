@@ -57,14 +57,17 @@ struct PreAuth {
     nick: Option<String>,
     pass: Option<String>,
     gecos: Option<(String, String)>,
-    wants_cap: bool,
+    sending_caps: bool,
     ping: PreAuthPing,
     ping_token: PingToken,
 }
 
 impl PreAuth {
     fn is_client_preamble_done(&self) -> bool {
-        self.gecos.is_some() && self.nick.is_some() && PreAuthPing::Complete == self.ping
+        self.gecos.is_some()
+            && self.nick.is_some()
+            && PreAuthPing::Complete == self.ping
+            && !self.sending_caps
     }
 }
 
@@ -94,6 +97,9 @@ enum ErrorCode {
     // RFC1459, sending it for invalid channel names
     InvalidChannel,
 
+    // irv3.1, using as intended, but maybe don't have the full mandatory support
+    InvalidCapCommand,
+
     // "length truncated" in aircd. Like with encoding, we're just rejecting
     LineTooLong,
 
@@ -122,6 +128,7 @@ impl ErrorCode {
             ErrorCode::UnknownError => 400,
             ErrorCode::NoSuchNick => 403,
             ErrorCode::InvalidChannel => 403,
+            ErrorCode::InvalidCapCommand => 410,
             ErrorCode::LineTooLong => 419,
             ErrorCode::UnknownCommand => 421,
             ErrorCode::FileError => 424,
@@ -149,6 +156,7 @@ enum ClientError {
     ErrorReason(ErrorCode, &'static str),
     ErrorNickReason(ErrorCode, &'static str),
     ErrorWordReason(ErrorCode, &'static str, &'static str),
+    ErrorNickWordReason(ErrorCode, &'static str, &'static str),
 }
 
 enum PreAuthOp {
@@ -156,6 +164,7 @@ enum PreAuthOp {
     Complete(Client),
     Ping(String),
     Pong(String),
+    CapList,
     Error(ClientError),
 }
 
@@ -224,6 +233,7 @@ impl System {
                     PreAuthOp::Complete(client) => self.on_board(token, client),
                     PreAuthOp::Ping(ref label) => vec![o(token, render_ping(label))],
                     PreAuthOp::Pong(ref label) => vec![o(token, render_pong(label))],
+                    PreAuthOp::CapList => vec![o(token, ":ircd CAP * LS :")],
                     PreAuthOp::Error(eo) => vec![self.render_error(eo, token)],
                 }
             });
@@ -302,6 +312,24 @@ impl System {
                     format!(":ircd {:03} {} :{}", code.into_numeric(), nick, msg),
                 )
             }
+            ClientError::ErrorNickWordReason(code, word, msg) => {
+                let nick = self
+                    .clients
+                    .get(&us)
+                    .map(|client| client.nick.as_str())
+                    .unwrap_or("*");
+
+                o(
+                    us,
+                    format!(
+                        ":ircd {:03} {} {} :{}",
+                        code.into_numeric(),
+                        nick,
+                        word,
+                        msg
+                    ),
+                )
+            }
             ClientError::ErrorWordReason(code, word, msg) => o(
                 us,
                 format!(":ircd {:03} {} :{}", code.into_numeric(), word, msg),
@@ -314,6 +342,13 @@ impl System {
         let mut state = self.registering.entry(token).or_default();
 
         match message.command() {
+            Ok(Command::CapLs(_version)) => {
+                state.sending_caps = true;
+                return PreAuthOp::CapList;
+            }
+            Ok(Command::CapEnd) => {
+                state.sending_caps = false;
+            }
             Ok(Command::Pass(pass)) => state.pass = Some(pass.to_string()),
             Ok(Command::Nick(nick)) => {
                 if !valid_nick(&nick) {
@@ -344,6 +379,13 @@ impl System {
                 info!("http command on channel: {:?}", raw);
                 // TODO: is it worth sending them anything?
                 return PreAuthOp::Error(ClientError::Die);
+            }
+            Ok(Command::CapUnknown) => {
+                return PreAuthOp::Error(ClientError::ErrorNickWordReason(
+                    ErrorCode::InvalidCapCommand,
+                    "*",
+                    "invalid cap command",
+                ));
             }
             _other => {
                 return PreAuthOp::Error(ClientError::ErrorReason(

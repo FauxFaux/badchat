@@ -400,7 +400,12 @@ pub fn serve_forever<F: FnMut(&HashSet<Token>, &mut Connections)>(
             Server::Plain(PlainServer { server })
         };
 
-        trace!("{:?} is a {} server on {:?}", token, if *ssl { "ssl" } else { "plain" }, addr);
+        trace!(
+            "{:?} is a {} server on {:?}",
+            token,
+            if *ssl { "ssl" } else { "plain" },
+            addr
+        );
 
         servers.insert(token, server);
     }

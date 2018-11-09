@@ -18,6 +18,13 @@ pub enum Command<'s> {
     Privmsg(&'s str, &'s str),
 
     Quit(Option<&'s str>),
+
+    /// version supported
+    CapLs(Option<&'s str>),
+    CapEnd,
+    /// we need to send a different error response to a normal unknown command
+    CapUnknown,
+
     Other(&'s str),
 }
 
@@ -161,7 +168,9 @@ impl ParsedMessage {
 
     pub fn command(&self) -> Result<Command, &'static str> {
         let cmd = self.cmd_str();
-        if cmd.eq_ignore_ascii_case("PRIVMSG") {
+        if cmd.contains(|c: char| !c.is_ascii_alphabetic()) {
+            Err("commands are made of letters")
+        } else if cmd.eq_ignore_ascii_case("PRIVMSG") {
             match self.args() {
                 ShortArgs::Two(dest, msg) => Ok(Command::Privmsg(dest, msg)),
                 _ => Err("PRIVMSG takes exactly two args"),
@@ -207,6 +216,16 @@ impl ParsedMessage {
                     Ok(Command::Join(channels, Some(keys), Some(real_name)))
                 }
                 _ => Err("JOIN takes channels, maybe keys, and maybe names"),
+            }
+        } else if cmd.eq_ignore_ascii_case("CAP") {
+            let mut args = self.args_iter();
+            let sub = args.next().ok_or("CAP requires sub-command")?;
+            if sub.eq_ignore_ascii_case("LS") {
+                Ok(Command::CapLs(args.next()))
+            } else if sub.eq_ignore_ascii_case("END") {
+                Ok(Command::CapEnd)
+            } else {
+                Ok(Command::CapUnknown)
             }
         } else {
             Ok(Command::Other(cmd))
