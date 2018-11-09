@@ -9,6 +9,7 @@ use std::io::Write;
 use std::net;
 use std::sync::Arc;
 
+use failure::err_msg;
 use failure::Error;
 use failure::ResultExt;
 use mio::tcp::Shutdown;
@@ -35,9 +36,6 @@ impl<'a> rustls::WriteV for WriteVAdapter<'a> {
         self.rawv.writev(bytes)
     }
 }
-
-const PLAIN_LISTENER: mio::Token = mio::Token(1);
-const TLS_LISTENER: mio::Token = mio::Token(2);
 
 pub type Connections = HashMap<mio::Token, Conn>;
 
@@ -103,9 +101,9 @@ impl TlsServer {
         let (socket, addr) = self.server.accept()?;
         debug!("Accepting new tls connection from {:?}", addr);
 
-        let mut tls_session = rustls::ServerSession::new(&self.tls_config);
+        let tls_session = rustls::ServerSession::new(&self.tls_config);
 
-        let mut net = NetConn {
+        let net = NetConn {
             socket,
             token: new_token,
             closing: false,
@@ -169,7 +167,11 @@ impl Conn {
                     let mut buf = [0u8; 4096];
 
                     // TODO: if the wakeup was a lie, presumably this can return WouldBlock
-                    let read = self.net.socket.read(&mut buf)?;
+                    let read = self
+                        .net
+                        .socket
+                        .read(&mut buf)
+                        .with_context(|_| err_msg("reading"))?;
                     if 0 == read {
                         // EOF!
                         self.net.closing = true;
@@ -182,8 +184,14 @@ impl Conn {
                 if readiness.is_writable() {
                     let (first, then) = output.as_slices();
                     // TODO: presumably this can at least theoretically block
-                    self.net.socket.write_all(first)?;
-                    self.net.socket.write_all(then)?;
+                    self.net
+                        .socket
+                        .write_all(first)
+                        .with_context(|_| err_msg("writing first"))?;
+                    self.net
+                        .socket
+                        .write_all(then)
+                        .with_context(|_| err_msg("writing then"))?;
                     output.clear();
                 }
             }
@@ -373,7 +381,7 @@ pub fn serve_forever<F: FnMut(&HashSet<Token>, &mut Connections)>(
     mut work: F,
 ) -> Result<(), Error> {
     let mut poll = mio::Poll::new()?;
-    let mut last_id: usize = 0;
+    let mut last_id: usize = 1;
 
     let mut servers = HashMap::with_capacity(4);
 
@@ -383,13 +391,16 @@ pub fn serve_forever<F: FnMut(&HashSet<Token>, &mut Connections)>(
         let token = mio::Token(last_id);
         last_id += 1;
 
-        let server = bind(&mut poll, addr.parse()?, token)?;
+        let addr = addr.parse()?;
+        let server = bind(&mut poll, addr, token)?;
 
         let server = if *ssl {
             Server::Tls(TlsServer::new(server, tls_config.clone()))
         } else {
             Server::Plain(PlainServer { server })
         };
+
+        trace!("{:?} is a {} server on {:?}", token, if *ssl { "ssl" } else { "plain" }, addr);
 
         servers.insert(token, server);
     }
@@ -404,6 +415,8 @@ pub fn serve_forever<F: FnMut(&HashSet<Token>, &mut Connections)>(
 
         // handle accepting and reading/writing data from/to active connections
         for event in events.iter() {
+            trace!("event: {:?}: {:?}", event.token(), event.readiness());
+
             let token = event.token();
             if let Some(server) = servers.get_mut(&token) {
                 last_id += 1;
@@ -441,7 +454,7 @@ fn bind(
 
     poll.register(
         &listener,
-        PLAIN_LISTENER,
+        token,
         mio::Ready::readable(),
         mio::PollOpt::level(),
     )?;

@@ -345,7 +345,7 @@ impl System {
                 // TODO: is it worth sending them anything?
                 return PreAuthOp::Error(ClientError::Die);
             }
-            other => {
+            _other => {
                 return PreAuthOp::Error(ClientError::ErrorReason(
                     ErrorCode::NotRegistered,
                     "invalid pre-auth command",
