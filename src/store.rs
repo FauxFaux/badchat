@@ -10,6 +10,8 @@ use rusqlite::types::ToSql;
 use rusqlite::Connection;
 use rusqlite::Transaction;
 
+use crate::ids::ChannelName;
+use crate::ids::Nick;
 use crate::ChannelId;
 
 pub struct Store {
@@ -27,11 +29,15 @@ impl Store {
         })
     }
 
-    pub fn user(&mut self, nick: &str, pass: &str) -> Option<i64> {
+    pub fn user(&mut self, nick: &Nick, pass: &str) -> Option<i64> {
         // committed inside `create_user`, not sure I like that?
         let tx = self.conn.transaction().unwrap_system();
 
-        let account_id = match load_id(&tx, "select account_id from nick where nick=?", &[nick]) {
+        let account_id = match load_id(
+            &tx,
+            "select account_id from nick where nick=?",
+            &[nick.as_ref()],
+        ) {
             Some(val) => val,
             None => {
                 let user = create_user(tx, nick, pass);
@@ -54,10 +60,10 @@ impl Store {
         None
     }
 
-    pub fn load_channel(&mut self, name: &str) -> ChannelId {
+    pub fn load_channel(&mut self, name: &ChannelName) -> ChannelId {
         let tx = self.conn.transaction().unwrap_system();
         ChannelId(
-            match load_id(&tx, "select id from channel where name=?", &[name]) {
+            match load_id(&tx, "select id from channel where name=?", &[name.as_ref()]) {
                 Some(id) => id,
                 None => create_channel(tx, name),
             },
@@ -82,7 +88,7 @@ where
     }
 }
 
-fn create_user(tx: Transaction, nick: &str, pass: &str) -> i64 {
+fn create_user(tx: Transaction, nick: &Nick, pass: &str) -> i64 {
     let now = unix_time();
 
     tx.execute("insert into account (creation_time) values (?)", &[now])
@@ -92,7 +98,7 @@ fn create_user(tx: Transaction, nick: &str, pass: &str) -> i64 {
 
     tx.execute(
         "insert into nick (nick, account_id) values (?,?)",
-        &[&nick as &ToSql, &account_id],
+        &[&nick.as_ref() as &ToSql, &account_id],
     )
     .unwrap_system();
 
@@ -112,12 +118,12 @@ fn create_user(tx: Transaction, nick: &str, pass: &str) -> i64 {
     account_id
 }
 
-fn create_channel(tx: Transaction, name: &str) -> i64 {
+fn create_channel(tx: Transaction, name: &ChannelName) -> i64 {
     let now = unix_time();
 
     tx.execute(
         "insert into channel (name, creation_time, mode) values (?,?,?)",
-        &[&name as &ToSql, &now, &""],
+        &[&name.as_ref() as &ToSql, &now, &""],
     )
     .unwrap_system();
 

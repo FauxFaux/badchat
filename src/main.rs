@@ -11,6 +11,7 @@ extern crate rusqlite;
 extern crate rustls;
 extern crate vecio;
 
+mod ids;
 mod proto;
 mod serv;
 mod store;
@@ -24,6 +25,8 @@ use failure::Error;
 use failure::ResultExt;
 use rand::Rng;
 
+use self::ids::ChannelName;
+use self::ids::Nick;
 use self::proto::Command;
 use self::proto::ParsedMessage as Message;
 
@@ -54,7 +57,7 @@ enum PreAuthPing {
 
 #[derive(Default)]
 struct PreAuth {
-    nick: Option<String>,
+    nick: Option<Nick>,
     pass: Option<String>,
     gecos: Option<(String, String)>,
     sending_caps: bool,
@@ -82,7 +85,7 @@ pub struct ChannelId(i64);
 
 struct Client {
     account_id: i64,
-    nick: String,
+    nick: Nick,
     channels: HashSet<ChannelId>,
 }
 
@@ -142,9 +145,9 @@ impl ErrorCode {
 
 #[derive(Debug)]
 enum Req {
-    JoinChannel(String),
-    MessageChannel(String, String),
-    MessageIndividual(String, String),
+    JoinChannel(ChannelName),
+    MessageChannel(ChannelName, String),
+    MessageIndividual(Nick, String),
     Ping(String),
     Pong(String),
 }
@@ -259,12 +262,7 @@ impl System {
     fn translate_event(&mut self, us: mio::Token, event: Req) -> Vec<Output> {
         let mut output = Vec::with_capacity(4);
 
-        let nick = self
-            .clients
-            .get(&us)
-            .expect("invalid client")
-            .nick
-            .to_string();
+        let nick = self.clients.get(&us).expect("invalid client").nick.clone();
 
         match event {
             Req::JoinChannel(ref channel) => output.extend(self.joined(us, channel)),
@@ -302,22 +300,26 @@ impl System {
                 }
             }
             ClientError::ErrorNickReason(code, msg) => {
+                // TODO: ugly
+                let absent = Nick::absent();
                 let nick = self
                     .clients
                     .get(&us)
-                    .map(|client| client.nick.as_str())
-                    .unwrap_or("*");
+                    .map(|client| &client.nick)
+                    .unwrap_or(&absent);
                 o(
                     us,
                     format!(":ircd {:03} {} :{}", code.into_numeric(), nick, msg),
                 )
             }
             ClientError::ErrorNickWordReason(code, word, msg) => {
+                // TODO: ugly
+                let absent = Nick::absent();
                 let nick = self
                     .clients
                     .get(&us)
-                    .map(|client| client.nick.as_str())
-                    .unwrap_or("*");
+                    .map(|client| &client.nick)
+                    .unwrap_or(&absent);
 
                 o(
                     us,
@@ -351,14 +353,15 @@ impl System {
             }
             Ok(Command::Pass(pass)) => state.pass = Some(pass.to_string()),
             Ok(Command::Nick(nick)) => {
-                if !valid_nick(&nick) {
-                    return PreAuthOp::Error(ClientError::ErrorNickReason(
-                        ErrorCode::ErroneousNickname,
-                        "invalid nickname; ascii letters, numbers, _. 2-12",
-                    ));
-                }
-
-                state.nick = Some(nick.to_string());
+                state.nick = Some(match Nick::new(nick) {
+                    Ok(nick) => nick,
+                    Err(_reason) => {
+                        return PreAuthOp::Error(ClientError::ErrorNickReason(
+                            ErrorCode::ErroneousNickname,
+                            "invalid nickname; ascii letters, numbers, _. 2-12",
+                        ))
+                    }
+                });
 
                 if state.ping == PreAuthPing::WaitingForNick {
                     state.ping = PreAuthPing::WaitingForPong;
@@ -411,9 +414,9 @@ impl System {
             ));
         }
 
-        let nick = state.nick.as_ref().unwrap();
+        let nick = state.nick.as_ref().unwrap().clone();
 
-        let account_id = match self.store.user(nick, state.pass.as_ref().unwrap()) {
+        let account_id = match self.store.user(&nick, state.pass.as_ref().unwrap()) {
             Some(id) => id,
             None => {
                 return PreAuthOp::Error(ClientError::FatalReason(
@@ -428,7 +431,7 @@ impl System {
 
         PreAuthOp::Complete(Client {
             account_id,
-            nick: nick.to_string(),
+            nick,
             channels: HashSet::new(),
         })
     }
@@ -440,33 +443,39 @@ impl System {
             {
                 let mut joins = Vec::with_capacity(4);
                 for chan in chan.split(',') {
-                    let chan: &str = chan.trim();
-                    if valid_channel(chan) {
-                        joins.push(Req::JoinChannel(chan.to_string()))
-                    } else {
-                        return Err(ClientError::ErrorWordReason(
-                            ErrorCode::InvalidChannel,
-                            "*",
-                            "channel name invalid",
-                        ));
-                    }
+                    let chan = match ChannelName::new(chan.trim().to_string()) {
+                        Ok(chan) => chan,
+                        Err(_reason) => {
+                            return Err(ClientError::ErrorWordReason(
+                                ErrorCode::InvalidChannel,
+                                "*",
+                                "channel name invalid",
+                            ))
+                        }
+                    };
+                    joins.push(Req::JoinChannel(chan));
                 }
                 Ok(joins)
             }
             Ok(Command::Privmsg(dest, msg)) => {
-                if dest.starts_with('#') && valid_channel(&dest) {
-                    Ok(vec![Req::MessageChannel(dest.to_string(), msg.to_string())])
-                } else if valid_nick(&dest) {
-                    Ok(vec![Req::MessageIndividual(
-                        dest.to_string(),
-                        msg.to_string(),
-                    )])
+                if dest.starts_with('#') {
+                    match ChannelName::new(dest) {
+                        Ok(chan) => Ok(vec![Req::MessageChannel(chan, msg.to_string())]),
+                        Err(_reason) => Err(ClientError::ErrorWordReason(
+                            ErrorCode::NoSuchNick,
+                            "*",
+                            "invalid channel",
+                        )),
+                    }
                 } else {
-                    Err(ClientError::ErrorWordReason(
-                        ErrorCode::NoSuchNick,
-                        "*",
-                        "invalid channel or nickname",
-                    ))
+                    match Nick::new(dest) {
+                        Ok(nick) => Ok(vec![Req::MessageIndividual(nick, msg.to_string())]),
+                        Err(_reason) => Err(ClientError::ErrorWordReason(
+                            ErrorCode::NoSuchNick,
+                            "*",
+                            "invalid channel or nickname",
+                        )),
+                    }
                 }
             }
             Ok(Command::Ping(arg)) => Ok(vec![Req::Pong(arg.to_string())]),
@@ -484,8 +493,8 @@ impl System {
     fn message_channel(
         &mut self,
         us: mio::Token,
-        our_nick: &str,
-        channel: &str,
+        our_nick: &Nick,
+        channel: &ChannelName,
         msg: &str,
     ) -> Vec<Output> {
         let mut output = Vec::with_capacity(32);
@@ -529,7 +538,7 @@ impl System {
         on_boarding
     }
 
-    fn joined(&mut self, us: mio::Token, chan: &String) -> Vec<Output> {
+    fn joined(&mut self, us: mio::Token, chan: &ChannelName) -> Vec<Output> {
         let mut output = Vec::with_capacity(32);
         let id = self.store.load_channel(chan);
 
@@ -758,34 +767,6 @@ fn pop_line(buf: &mut VecDeque<u8>) -> PoppedLine {
     } else {
         PoppedLine::NotReady
     }
-}
-
-fn valid_channel(chan: &str) -> bool {
-    if !chan.starts_with('#') {
-        return false;
-    }
-
-    valid_nick(&chan[1..])
-}
-
-fn valid_nick(nick: &str) -> bool {
-    if nick.len() <= 1 || nick.len() >= 12 {
-        return false;
-    }
-
-    if nick.contains(|c| !valid_nick_char(c)) {
-        return false;
-    }
-
-    if !nick.chars().next().unwrap().is_ascii_alphabetic() {
-        return false;
-    }
-
-    true
-}
-
-fn valid_nick_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || "_".contains(c)
 }
 
 fn main() -> Result<(), Error> {
