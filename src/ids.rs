@@ -22,6 +22,21 @@ use std::fmt;
 // Bridges are... a single connection/account, with multiple talkers, and no extra caps? Beyond
 // the "multiple talker" cap?
 
+// New thoughts:
+// A `talker` is going to be called a `user`. A `user` has a nick (globally unique), but
+// isn't that nick, 'cos they can change. A `user` can migrate between `connection`s.
+// A `user` always has an `account` and a `nick`. The `account` probably doesn't change?
+// `NICKSERV GROUP` would probably change the `account`, if implemented in that direction.
+// A `user` is in `channel`s. Multiple `user`s can be online on the same `account`? Kinda.
+// Potential confusion with the `USER` command, but we're already calling that GECOS, and
+// broadly ignoring it totally. Afaik no clients let you put useful information in most of
+// the fields anyway, so it's not a good way to transfer pre-auth info. Freenode pack it into
+// the `PASS` command, as `PASS account:password`, which might be useful if their `NICK` rejects
+// existing `NICK`s, and/or if your client sucks and sends Foo_____2 and it's hard to turn off.
+// Maybe allow both? Ambiguous with : in password, but it would have to be `[valid nick]:6+`,
+// which significantly reduces the number of things which need double checks. Increases the
+// complexity of the auth code, though.
+
 // Concern: Almost identical structs here, could share a Target / Ident / ?
 // Concern: Is a nick different from an ident (nick!~user@host)? An unresolved ident?
 
