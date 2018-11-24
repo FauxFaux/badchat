@@ -216,7 +216,8 @@ impl Conn {
             && match &mut self.extra {
                 ConnType::Plain(output) => output.is_empty(),
                 ConnType::Tls(tls) => !tls.wants_write(),
-            } {
+            }
+        {
             let _ = self.net.socket.shutdown(Shutdown::Both);
             self.net.closed = true;
             return Ok(());

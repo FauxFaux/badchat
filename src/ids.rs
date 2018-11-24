@@ -22,7 +22,6 @@ use std::fmt;
 // Bridges are... a single connection/account, with multiple talkers, and no extra caps? Beyond
 // the "multiple talker" cap?
 
-
 // Concern: Almost identical structs here, could share a Target / Ident / ?
 // Concern: Is a nick different from an ident (nick!~user@host)? An unresolved ident?
 
