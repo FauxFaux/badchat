@@ -46,6 +46,8 @@ struct System {
     store: store::Store,
     registering: HashMap<ConnId, PreAuth>,
     clients: HashMap<ConnId, Client>,
+    users: HashMap<UserId, User>,
+    next_user_id: u64,
 }
 
 #[derive(Copy, Clone, Eq, PartialEq)]
@@ -81,10 +83,22 @@ impl Default for PreAuthPing {
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct AccountId(i64);
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ChannelId(i64);
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct UserId(u64);
+
+#[derive(Debug)]
 struct Client {
-    account_id: i64,
+    account_id: AccountId,
+    users: HashSet<UserId>,
+}
+
+#[derive(Debug)]
+struct User {
     nick: Nick,
     channels: HashSet<ChannelId>,
 }
@@ -164,7 +178,7 @@ enum ClientError {
 
 enum PreAuthOp {
     Waiting,
-    Complete(Client),
+    Complete((AccountId, User)),
     Ping(String),
     Pong(String),
     CapList,
@@ -192,6 +206,8 @@ impl System {
         Ok(System {
             store: store::Store::new()?,
             clients: HashMap::new(),
+            users: HashMap::new(),
+            next_user_id: 0,
             registering: HashMap::new(),
         })
     }
@@ -233,7 +249,9 @@ impl System {
             } else {
                 match self.translate_pre_auth(token, message) {
                     PreAuthOp::Waiting => vec![],
-                    PreAuthOp::Complete(client) => self.on_board(token, client),
+                    PreAuthOp::Complete((account_id, client)) => {
+                        self.on_board(token, account_id, client)
+                    }
                     PreAuthOp::Ping(ref label) => vec![o(token, render_ping(label))],
                     PreAuthOp::Pong(ref label) => vec![o(token, render_pong(label))],
                     PreAuthOp::CapList => vec![o(token, ":ircd CAP * LS :")],
@@ -262,7 +280,7 @@ impl System {
     fn translate_event(&mut self, us: mio::Token, event: Req) -> Vec<Output> {
         let mut output = Vec::with_capacity(4);
 
-        let nick = self.clients.get(&us).expect("invalid client").nick.clone();
+        let nick = unimplemented!("{:?}", self.clients.get(&us).expect("invalid client"));
 
         match event {
             Req::JoinChannel(ref channel) => output.extend(self.joined(us, channel)),
@@ -305,7 +323,7 @@ impl System {
                 let nick = self
                     .clients
                     .get(&us)
-                    .map(|client| &client.nick)
+                    .map(|client| unimplemented!())
                     .unwrap_or(&absent);
                 o(
                     us,
@@ -318,7 +336,7 @@ impl System {
                 let nick = self
                     .clients
                     .get(&us)
-                    .map(|client| &client.nick)
+                    .map(|client| unimplemented!())
                     .unwrap_or(&absent);
 
                 o(
@@ -416,7 +434,7 @@ impl System {
 
         let nick = state.nick.as_ref().unwrap().clone();
 
-        let account_id = match self.store.user(&nick, state.pass.as_ref().unwrap()) {
+        let account_id = AccountId(match self.store.user(&nick, state.pass.as_ref().unwrap()) {
             Some(id) => id,
             None => {
                 return PreAuthOp::Error(ClientError::FatalReason(
@@ -427,13 +445,15 @@ impl System {
                     ),
                 ));
             }
-        };
+        });
 
-        PreAuthOp::Complete(Client {
+        PreAuthOp::Complete((
             account_id,
-            nick,
-            channels: HashSet::new(),
-        })
+            User {
+                nick,
+                channels: HashSet::new(),
+            },
+        ))
     }
 
     fn translate_client_message(&mut self, message: Message) -> Result<Vec<Req>, ClientError> {
@@ -501,18 +521,18 @@ impl System {
 
         let id = self.store.load_channel(channel);
 
-        for (other_token, other_client) in &self.clients {
-            if *other_token == us {
+        for (other_id, other_user) in &self.users {
+            if *other_id == unimplemented!("us") {
                 // don't message ourselves
                 continue;
             }
 
-            if !other_client.channels.contains(&id) {
+            if !other_user.channels.contains(&id) {
                 continue;
             }
 
             output.push(o(
-                *other_token,
+                unimplemented!("*other_token"),
                 format!(":{}!~@irc PRIVMSG {} :{}", our_nick, channel, msg),
             ));
         }
@@ -520,8 +540,8 @@ impl System {
         output
     }
 
-    fn on_board(&mut self, token: mio::Token, client: Client) -> Vec<Output> {
-        let on_boarding = send_on_boarding(&client.nick)
+    fn on_board(&mut self, token: mio::Token, account_id: AccountId, user: User) -> Vec<Output> {
+        let on_boarding = send_on_boarding(&user.nick)
             .into_iter()
             .map(|line| o(token, line))
             .collect();
@@ -530,6 +550,19 @@ impl System {
             self.registering.remove(&token).is_some(),
             "should be removing a registering client"
         );
+
+        let new_user = UserId(self.next_user_id);
+        self.users.insert(new_user, user);
+        self.next_user_id += 1;
+
+        let mut users = HashSet::new();
+        users.insert(new_user);
+
+        let client = Client {
+            account_id,
+            users,
+        };
+
         assert!(
             self.clients.insert(token, client).is_none(),
             "shouldn't be replacing an existing client"
@@ -547,17 +580,19 @@ impl System {
                 .clients
                 .get_mut(&us)
                 .expect("client generating event should exist");
-            if !client.channels.insert(id) {
+            if !unimplemented!("client.channels.insert(id)") {
                 return Vec::new();
             }
-            client.nick.to_string()
+            unimplemented!("client.nick.to_string()")
         };
+
+        let nick = "unimplemented!";
 
         // client joins, 322 topic, 333 topic who/time, 353 users, 366 end of names
 
         // send everyone the join message
         for (other_token, other_client) in &self.clients {
-            if !other_client.channels.contains(&id) {
+            if unimplemented!("!other_client.channels.contains(&id)") {
                 continue;
             }
             output.push(o(*other_token, format!(":{}!~@irc JOIN {}", nick, chan)));
@@ -577,8 +612,8 @@ impl System {
         for names in wrapped(
             self.clients
                 .values()
-                .filter(|client| client.channels.contains(&id))
-                .map(|client| client.nick.as_ref()),
+                .filter(|client| unimplemented!("client.channels.contains(&id)"))
+                .map(|client| unimplemented!("client.nick.as_ref()")),
         ) {
             output.push(o(
                 us,
