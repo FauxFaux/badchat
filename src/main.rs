@@ -23,6 +23,7 @@ use std::fmt;
 
 use failure::Error;
 use failure::ResultExt;
+use maplit::hashset;
 use rand::Rng;
 
 use self::ids::ChannelName;
@@ -555,12 +556,9 @@ impl System {
         self.users.insert(new_user, user);
         self.next_user_id += 1;
 
-        let mut users = HashSet::new();
-        users.insert(new_user);
-
         let client = Client {
             account_id,
-            users,
+            users: hashset! { new_user },
         };
 
         assert!(
