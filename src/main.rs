@@ -214,51 +214,16 @@ impl System {
     }
 
     fn work(&mut self, tokens: &HashSet<mio::Token>, connections: &mut serv::Connections) {
-        // we expect there to be only one message per client
-        let mut messages = Vec::with_capacity(tokens.len());
+        let mut output = Vec::with_capacity(4 * tokens.len());
 
         for token in tokens {
-            if let Some(client) = connections.get_mut(token) {
-                messages.extend(take_messages(client).into_iter().map(|r| (*token, r)));
-            } else {
-                unreachable!("server said there was work for a connection, but it's gone")
-            }
-        }
-
-        let mut output = Vec::with_capacity(messages.len());
-
-        for (token, message) in messages {
-            let message = match message {
-                Ok(message) => message,
-                Err(e) => {
-                    output.push(self.render_error(e, token));
-                    continue;
-                }
-            };
-
-            output.extend(if self.clients.contains_key(&token) {
-                unpack_command(message.command())
-                    .map(|events| {
-                        events
-                            .into_iter()
-                            .flat_map(|event| self.translate_event(token, event))
-                            // TODO: it feels like this collect should be unnecessary, but can't
-                            // TODO: reconcile the types with the vec![] below in the error handling
-                            .collect()
-                    })
-                    .unwrap_or_else(|err| vec![self.render_error(err, token)])
-            } else {
-                match self.translate_pre_auth(token, message) {
-                    PreAuthOp::Waiting => vec![],
-                    PreAuthOp::Complete((account_id, client)) => {
-                        self.on_board(token, account_id, client)
-                    }
-                    PreAuthOp::Ping(ref label) => vec![o(token, render_ping(label))],
-                    PreAuthOp::Pong(ref label) => vec![o(token, render_pong(label))],
-                    PreAuthOp::CapList => vec![o(token, ":ircd CAP * LS :")],
-                    PreAuthOp::Error(eo) => vec![self.render_error(eo, token)],
-                }
-            });
+            self.work_one(
+                *token,
+                connections
+                    .get_mut(token)
+                    .expect("server said there was work for a connection, but it's gone"),
+                &mut output,
+            );
         }
 
         for Output {
@@ -275,6 +240,48 @@ impl System {
                     conn.start_closing();
                 }
             }
+        }
+    }
+
+    fn work_one(&mut self, us: mio::Token, conn: &mut serv::Conn, output: &mut Vec<Output>) -> () {
+        for message in take_messages(conn) {
+            let message = match message {
+                Ok(message) => message,
+                Err(e) => {
+                    output.push(self.render_error(e, us));
+                    continue;
+                }
+            };
+
+            output.extend(if self.clients.contains_key(&us) {
+                self.work_client(us, message)
+            } else {
+                self.work_pre_auth(us, message)
+            });
+        }
+    }
+
+    fn work_client(&mut self, us: mio::Token, message: Message) -> Vec<Output> {
+        unpack_command(message.command())
+            .map(|events| {
+                events
+                    .into_iter()
+                    .flat_map(|event| self.translate_event(us, event))
+                    // TODO: it feels like this collect should be unnecessary, but can't
+                    // TODO: reconcile the types with the vec![] below in the error handling
+                    .collect()
+            })
+            .unwrap_or_else(|err| vec![self.render_error(err, us)])
+    }
+
+    fn work_pre_auth(&mut self, us: mio::Token, message: Message) -> Vec<Output> {
+        match self.translate_pre_auth(us, message) {
+            PreAuthOp::Waiting => vec![],
+            PreAuthOp::Complete((account_id, client)) => self.on_board(us, account_id, client),
+            PreAuthOp::Ping(ref label) => vec![o(us, render_ping(label))],
+            PreAuthOp::Pong(ref label) => vec![o(us, render_pong(label))],
+            PreAuthOp::CapList => vec![o(us, ":ircd CAP * LS :")],
+            PreAuthOp::Error(eo) => vec![self.render_error(eo, us)],
         }
     }
 
@@ -659,7 +666,7 @@ fn take_messages(conn: &mut serv::Conn) -> Vec<Result<Message, ClientError>> {
     if conn.input.broken {
         match pop_line(&mut conn.input.buf) {
             PoppedLine::Done(_) | PoppedLine::TooLong => {
-                conn.input.broken = false;;
+                conn.input.broken = false;
             }
             PoppedLine::NotReady => {
                 conn.input.buf.clear();
