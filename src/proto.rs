@@ -1,5 +1,7 @@
 use std::ops::Range;
 
+use crate::ids::Nick;
+
 #[derive(Copy, Clone, Debug)]
 pub enum Command<'s> {
     Pass(&'s str),
@@ -164,6 +166,24 @@ impl ParsedMessage {
             None => ShortArgs::Four(first, second, third, fourth),
             Some(_) => ShortArgs::More,
         }
+    }
+
+    pub fn source_nick(&self) -> Result<Option<Nick>, &'static str> {
+        let src = match self.source_str() {
+            Some(src) => src,
+            None => return Ok(None),
+        };
+
+        let bang = match src.find('!') {
+            Some(bang) => bang,
+            None => return Err("no bang"),
+        };
+
+        if 0 == bang {
+            return Err("no nick before bang");
+        }
+
+        Ok(Some(Nick::new(&src[..bang])?))
     }
 
     pub fn command(&self) -> Result<Command, &'static str> {

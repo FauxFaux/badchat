@@ -51,6 +51,11 @@ pub struct ChannelName {
     inner: String,
 }
 
+#[derive(Clone, Debug)]
+pub struct HostMask {
+    inner: String,
+}
+
 impl Nick {
     pub fn new<S: AsRef<str> + ToString>(from: S) -> Result<Nick, &'static str> {
         if !valid_nick(from.as_ref()) {
@@ -78,6 +83,14 @@ impl ChannelName {
         Ok(ChannelName {
             inner: from.to_string(),
         })
+    }
+}
+
+impl HostMask {
+    pub fn new() -> HostMask {
+        HostMask {
+            inner: String::new(),
+        }
     }
 }
 
@@ -121,6 +134,12 @@ fn valid_nick(nick: &str) -> bool {
 
 fn valid_nick_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || "_".contains(c)
+}
+
+impl PartialEq for Nick {
+    fn eq(&self, other: &Nick) -> bool {
+        other.inner.eq_ignore_ascii_case(&self.inner)
+    }
 }
 
 impl fmt::Display for Nick {

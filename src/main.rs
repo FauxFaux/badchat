@@ -27,6 +27,7 @@ use maplit::hashset;
 use rand::Rng;
 
 use self::ids::ChannelName;
+use self::ids::HostMask;
 use self::ids::Nick;
 use self::proto::Command;
 use self::proto::ParsedMessage as Message;
@@ -95,12 +96,14 @@ pub struct UserId(u64);
 #[derive(Debug)]
 struct Client {
     account_id: AccountId,
+    default_user: UserId,
     users: HashSet<UserId>,
 }
 
 #[derive(Debug)]
 struct User {
     nick: Nick,
+    host_mask: HostMask,
     channels: HashSet<ChannelId>,
 }
 
@@ -262,16 +265,55 @@ impl System {
     }
 
     fn work_client(&mut self, us: mio::Token, message: Message) -> Vec<Output> {
-        unpack_command(message.command())
-            .map(|events| {
-                events
-                    .into_iter()
-                    .flat_map(|event| self.translate_event(us, event))
-                    // TODO: it feels like this collect should be unnecessary, but can't
-                    // TODO: reconcile the types with the vec![] below in the error handling
-                    .collect()
-            })
-            .unwrap_or_else(|err| vec![self.render_error(err, us)])
+        let client = self.clients.get(&us).expect("just checked");
+        assert_eq!(0, client.users.len(), "code cannot handle sub users");
+
+        let user = match self.users.get(&client.default_user) {
+            Some(user) => user,
+            None => unimplemented!("invalid default user?"),
+        };
+
+        let user = match message.source_nick() {
+            Ok(Some(source_nick)) => {
+                if user.nick != source_nick {
+                    return vec![self.render_error(
+                        ClientError::ErrorReason(
+                            ErrorCode::ErroneousNickname,
+                            "invalid input nickname",
+                        ),
+                        us,
+                    )];
+                }
+
+                user
+            }
+            Ok(None) => user,
+            Err(err) => {
+                return vec![self.render_error(
+                    ClientError::ErrorReason(
+                        ErrorCode::ErroneousNickname,
+                        "invalid hostmask nickname",
+                    ),
+                    us,
+                )];
+            }
+        };
+
+        let mut output = Vec::with_capacity(4);
+        match unpack_command(message.command()) {
+            Ok(reqs) => {
+                for req in reqs {
+                    output.extend(self.work_req(us, req));
+                }
+            }
+            Err(e) => output.push(self.render_error(e, us)),
+        }
+
+        output
+    }
+
+    fn work_req(&mut self, us: mio::Token, req: Req) -> Vec<Output> {
+        self.translate_event(us, req)
     }
 
     fn work_pre_auth(&mut self, us: mio::Token, message: Message) -> Vec<Output> {
@@ -459,6 +501,7 @@ impl System {
             account_id,
             User {
                 nick,
+                host_mask: HostMask::new(),
                 channels: HashSet::new(),
             },
         ))
@@ -511,7 +554,8 @@ impl System {
 
         let client = Client {
             account_id,
-            users: hashset! { new_user },
+            default_user: new_user,
+            users: HashSet::new(),
         };
 
         assert!(
