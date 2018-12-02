@@ -237,7 +237,7 @@ impl System {
             };
 
             output.extend(if self.clients.contains_key(&token) {
-                self.translate_client_message(message)
+                unpack_command(message.command())
                     .map(|events| {
                         events
                             .into_iter()
@@ -457,60 +457,6 @@ impl System {
         ))
     }
 
-    fn translate_client_message(&mut self, message: Message) -> Result<Vec<Req>, ClientError> {
-        match message.command() {
-            Ok(Command::Join(ref chan, ref keys, ref real_name))
-                if keys.is_none() && real_name.is_none() =>
-            {
-                let mut joins = Vec::with_capacity(4);
-                for chan in chan.split(',') {
-                    let chan = match ChannelName::new(chan.trim().to_string()) {
-                        Ok(chan) => chan,
-                        Err(_reason) => {
-                            return Err(ClientError::ErrorWordReason(
-                                ErrorCode::InvalidChannel,
-                                "*",
-                                "channel name invalid",
-                            ))
-                        }
-                    };
-                    joins.push(Req::JoinChannel(chan));
-                }
-                Ok(joins)
-            }
-            Ok(Command::Privmsg(dest, msg)) => {
-                if dest.starts_with('#') {
-                    match ChannelName::new(dest) {
-                        Ok(chan) => Ok(vec![Req::MessageChannel(chan, msg.to_string())]),
-                        Err(_reason) => Err(ClientError::ErrorWordReason(
-                            ErrorCode::NoSuchNick,
-                            "*",
-                            "invalid channel",
-                        )),
-                    }
-                } else {
-                    match Nick::new(dest) {
-                        Ok(nick) => Ok(vec![Req::MessageIndividual(nick, msg.to_string())]),
-                        Err(_reason) => Err(ClientError::ErrorWordReason(
-                            ErrorCode::NoSuchNick,
-                            "*",
-                            "invalid channel or nickname",
-                        )),
-                    }
-                }
-            }
-            Ok(Command::Ping(arg)) => Ok(vec![Req::Pong(arg.to_string())]),
-            Ok(Command::Pong(..)) => Ok(vec![]),
-            other => {
-                info!("invalid command: {:?}", other);
-                Err(ClientError::ErrorNickReason(
-                    ErrorCode::UnknownCommand,
-                    "unrecognised or mis-parsed command",
-                ))
-            }
-        }
-    }
-
     fn message_channel(
         &mut self,
         us: mio::Token,
@@ -622,6 +568,60 @@ impl System {
         output.push(o(us, format!(":ircd 366 {} {} :</names>", nick, chan)));
 
         output
+    }
+}
+
+fn unpack_command(command: Result<Command, &'static str>) -> Result<Vec<Req>, ClientError> {
+    match command {
+        Ok(Command::Join(ref chan, ref keys, ref real_name))
+            if keys.is_none() && real_name.is_none() =>
+        {
+            let mut joins = Vec::with_capacity(4);
+            for chan in chan.split(',') {
+                let chan = match ChannelName::new(chan.trim().to_string()) {
+                    Ok(chan) => chan,
+                    Err(_reason) => {
+                        return Err(ClientError::ErrorWordReason(
+                            ErrorCode::InvalidChannel,
+                            "*",
+                            "channel name invalid",
+                        ))
+                    }
+                };
+                joins.push(Req::JoinChannel(chan));
+            }
+            Ok(joins)
+        }
+        Ok(Command::Privmsg(dest, msg)) => {
+            if dest.starts_with('#') {
+                match ChannelName::new(dest) {
+                    Ok(chan) => Ok(vec![Req::MessageChannel(chan, msg.to_string())]),
+                    Err(_reason) => Err(ClientError::ErrorWordReason(
+                        ErrorCode::NoSuchNick,
+                        "*",
+                        "invalid channel",
+                    )),
+                }
+            } else {
+                match Nick::new(dest) {
+                    Ok(nick) => Ok(vec![Req::MessageIndividual(nick, msg.to_string())]),
+                    Err(_reason) => Err(ClientError::ErrorWordReason(
+                        ErrorCode::NoSuchNick,
+                        "*",
+                        "invalid channel or nickname",
+                    )),
+                }
+            }
+        }
+        Ok(Command::Ping(arg)) => Ok(vec![Req::Pong(arg.to_string())]),
+        Ok(Command::Pong(..)) => Ok(vec![]),
+        other => {
+            info!("invalid command: {:?}", other);
+            Err(ClientError::ErrorNickReason(
+                ErrorCode::UnknownCommand,
+                "unrecognised or mis-parsed command",
+            ))
+        }
     }
 }
 
