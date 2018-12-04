@@ -197,6 +197,14 @@ struct Output {
     then_close: bool,
 }
 
+struct OutputUser {
+    from: UserId,
+    to: UserId,
+    tags: (),
+    cmd_and_args: String,
+    then_close: bool,
+}
+
 fn o<S: ToString>(token: mio::Token, message: S) -> Output {
     Output {
         token,
@@ -205,13 +213,25 @@ fn o<S: ToString>(token: mio::Token, message: S) -> Output {
     }
 }
 
+fn u<S: ToString>(from: UserId, to: UserId, cmd_and_args: S) -> OutputUser {
+    OutputUser {
+        from,
+        to,
+        tags: (),
+        cmd_and_args: cmd_and_args.to_string(),
+        then_close: false,
+    }
+}
+
+const UID_SERVER: UserId = UserId(0);
+
 impl System {
     fn new() -> Result<System, Error> {
         Ok(System {
             store: store::Store::new()?,
             clients: HashMap::new(),
             users: HashMap::new(),
-            next_user_id: 0,
+            next_user_id: UID_SERVER.0 + 1,
             registering: HashMap::new(),
         })
     }
@@ -229,29 +249,61 @@ impl System {
             );
         }
 
-        for Output {
-            token,
-            line,
+        for OutputUser {
+            from,
+            to,
+            tags,
+            cmd_and_args,
             then_close,
         } in output
         {
-            if let Some(conn) = connections.get_mut(&token) {
-                if let Err(e) = conn.write_line(line) {
-                    info!("{:?}: error sending normal message: {:?}", token, e);
-                    conn.start_closing();
-                } else if then_close {
-                    conn.start_closing();
+            enum Dest {
+                Default(mio::Token),
+                An(mio::Token),
+                None,
+            };
+
+            let mut dest = Dest::None;
+
+            let src = match self.users.get(&from) {
+                Some(src) => src,
+                None => unimplemented!("missing user.. disconnected, or server"),
+            };
+
+            for (token, client) in &self.clients {
+                if client.default_user == to {
+                    dest = Dest::Default(*token);
                 }
+            }
+
+            match dest {
+                Dest::Default(token) => {
+                    if let Some(conn) = connections.get_mut(&token) {
+                        let line = format!(":{}!~@. {}", src.nick, cmd_and_args);
+                        if let Err(e) = conn.write_line(line) {
+                            info!("{:?}: error sending normal message: {:?}", token, e);
+                            conn.start_closing();
+                        } else if then_close {
+                            conn.start_closing();
+                        }
+                    }
+                }
+                _ => unimplemented!("unsupported dest"),
             }
         }
     }
 
-    fn work_one(&mut self, us: mio::Token, conn: &mut serv::Conn, output: &mut Vec<Output>) -> () {
+    fn work_one(
+        &mut self,
+        us: mio::Token,
+        conn: &mut serv::Conn,
+        output: &mut Vec<OutputUser>,
+    ) -> () {
         for message in take_messages(conn) {
             let message = match message {
                 Ok(message) => message,
                 Err(e) => {
-                    output.push(self.render_error(e, us));
+                    output.push(unimplemented!("{:?}", render_error(e)));
                     continue;
                 }
             };
@@ -259,152 +311,116 @@ impl System {
             output.extend(if self.clients.contains_key(&us) {
                 self.work_client(us, message)
             } else {
-                self.work_pre_auth(us, message)
+                self.work_pre_auth(us, message).into_iter()
+                    .map(|(fatal, msg)| OutputUser {
+                        // TODO: is either of these reasonable?
+                        from: UID_SERVER,
+                        to: UID_SERVER,
+                        tags: (),
+                        cmd_and_args: msg,
+                        then_close: fatal,
+                    })
+                    .collect()
             });
         }
     }
 
-    fn work_client(&mut self, us: mio::Token, message: Message) -> Vec<Output> {
+    fn work_client(&mut self, us: mio::Token, message: Message) -> Vec<OutputUser> {
         let client = self.clients.get(&us).expect("just checked");
-        assert_eq!(0, client.users.len(), "code cannot handle sub users");
+        assert_eq!(0, client.users.len(), "TODO: code cannot handle sub users");
 
-        let user = match self.users.get(&client.default_user) {
-            Some(user) => user,
-            None => unimplemented!("invalid default user?"),
-        };
-
-        let user = match message.source_nick() {
+        let user_id = match message.source_nick() {
             Ok(Some(source_nick)) => {
+                let user = match self.users.get(&client.default_user) {
+                    Some(user) => user,
+                    None => unimplemented!("invalid default user?"),
+                };
+
                 if user.nick != source_nick {
-                    return vec![self.render_error(
+                    return unimplemented!(
+                        r#"vec![self.render_error(
                         ClientError::ErrorReason(
                             ErrorCode::ErroneousNickname,
                             "invalid input nickname",
                         ),
                         us,
-                    )];
+                    )]"#
+                    );
                 }
 
-                user
+                // TODO: else block here
+                client.default_user
             }
-            Ok(None) => user,
+            Ok(None) => client.default_user,
             Err(err) => {
-                return vec![self.render_error(
+                return unimplemented!(
+                    r#"vec![self.render_error(
                     ClientError::ErrorReason(
                         ErrorCode::ErroneousNickname,
                         "invalid hostmask nickname",
                     ),
                     us,
-                )];
+                )]"#
+                );
             }
         };
 
         let mut output = Vec::with_capacity(4);
+
         match unpack_command(message.command()) {
             Ok(reqs) => {
                 for req in reqs {
-                    output.extend(self.work_req(us, req));
+                    output.extend(self.work_req(user_id, req));
                 }
             }
-            Err(e) => output.push(self.render_error(e, us)),
+            Err(e) => unimplemented!("output.push(self.render_error(e, us))"),
         }
 
         output
     }
 
-    fn work_req(&mut self, us: mio::Token, req: Req) -> Vec<Output> {
+    fn work_req(&mut self, us: UserId, req: Req) -> Vec<OutputUser> {
         self.translate_event(us, req)
     }
 
-    fn work_pre_auth(&mut self, us: mio::Token, message: Message) -> Vec<Output> {
+    // TODO: Clearly this should be a Result<String, String>
+    fn work_pre_auth(&mut self, us: mio::Token, message: Message) -> Vec<(bool, String)> {
         match self.translate_pre_auth(us, message) {
             PreAuthOp::Waiting => vec![],
-            PreAuthOp::Complete((account_id, client)) => self.on_board(us, account_id, client),
-            PreAuthOp::Ping(ref label) => vec![o(us, render_ping(label))],
-            PreAuthOp::Pong(ref label) => vec![o(us, render_pong(label))],
-            PreAuthOp::CapList => vec![o(us, ":ircd CAP * LS :")],
-            PreAuthOp::Error(eo) => vec![self.render_error(eo, us)],
+            PreAuthOp::Complete((account_id, client)) => self.on_board(us, account_id, client).into_iter().map(|m| (false, m)).collect(),
+            PreAuthOp::Ping(ref label) => vec![(false, render_ping(label))],
+            PreAuthOp::Pong(ref label) => vec![(false, render_pong(label))],
+            PreAuthOp::CapList => vec![(false, "CAP * LS :".to_string())],
+            PreAuthOp::Error(eo) => vec![render_error(eo)],
         }
     }
 
-    fn translate_event(&mut self, us: mio::Token, event: Req) -> Vec<Output> {
+    fn translate_event(&mut self, us: UserId, event: Req) -> Vec<OutputUser> {
         let mut output = Vec::with_capacity(4);
 
-        let nick = unimplemented!("{:?}", self.clients.get(&us).expect("invalid client"));
-
         match event {
-            Req::JoinChannel(ref channel) => output.extend(self.joined(us, channel)),
-            Req::MessageIndividual(other_nick, msg) => output.push(o(
-                us,
-                format!("{}!~@irc PRIVMSG {} :{}", nick, other_nick, msg),
-            )),
-            Req::MessageChannel(ref channel, ref msg) => {
-                output.extend(self.message_channel(us, &nick, channel, msg))
+            Req::JoinChannel(ref channel) => output.extend(self.joined(us,channel)),
+            Req::MessageIndividual(other_nick, msg) => {
+                let to = match unimplemented!("self.lookup_user(&other_nick)") {
+                    Some(user_id) => user_id,
+                    None => {
+                        return vec![u(
+                            UID_SERVER,
+                            us,
+                            format!("{:03} :no such user", ErrorCode::NoSuchNick.into_numeric()),
+                        )]
+                    }
+                };
+                output.push(u(us, to, format!("PRIVMSG {} :{}", other_nick, msg)))
             }
-            Req::Ping(ref symbol) => output.push(o(us, render_ping(symbol))),
-            Req::Pong(ref symbol) => output.push(o(us, render_pong(symbol))),
+            Req::MessageChannel(ref channel, ref msg) => output.extend(
+                self.message_channel(us, channel, msg)
+            ),
+            Req::Ping(ref symbol) => output.push(u(UID_SERVER, us, render_ping(symbol))),
+            Req::Pong(ref symbol) => output.push(u(UID_SERVER, us, render_pong(symbol))),
         }
 
         output
-    }
-
-    fn render_error(&self, err: ClientError, us: mio::Token) -> Output {
-        match err {
-            ClientError::Die => Output {
-                token: us,
-                line: ":ircd 999 * :You angered us in some way, sorry. Bye.".to_string(),
-                then_close: true,
-            },
-            ClientError::ErrorReason(code, msg) => {
-                // I don't think this star should be here, but xchat eats words otherwise.
-                o(us, format!(":ircd {:03} * :{}", code.into_numeric(), msg))
-            }
-            ClientError::FatalReason(code, msg) => {
-                // Same format string (bug) as above
-                Output {
-                    token: us,
-                    line: format!(":ircd {:03} * :{}", code.into_numeric(), msg),
-                    then_close: true,
-                }
-            }
-            ClientError::ErrorNickReason(code, msg) => {
-                // TODO: ugly
-                let absent = Nick::absent();
-                let nick = self
-                    .clients
-                    .get(&us)
-                    .map(|client| unimplemented!())
-                    .unwrap_or(&absent);
-                o(
-                    us,
-                    format!(":ircd {:03} {} :{}", code.into_numeric(), nick, msg),
-                )
-            }
-            ClientError::ErrorNickWordReason(code, word, msg) => {
-                // TODO: ugly
-                let absent = Nick::absent();
-                let nick = self
-                    .clients
-                    .get(&us)
-                    .map(|client| unimplemented!())
-                    .unwrap_or(&absent);
-
-                o(
-                    us,
-                    format!(
-                        ":ircd {:03} {} {} :{}",
-                        code.into_numeric(),
-                        nick,
-                        word,
-                        msg
-                    ),
-                )
-            }
-            ClientError::ErrorWordReason(code, word, msg) => o(
-                us,
-                format!(":ircd {:03} {} :{}", code.into_numeric(), word, msg),
-            ),
-        }
     }
 
     /// https://modern.ircdocs.horse/#connection-registration
@@ -509,11 +525,10 @@ impl System {
 
     fn message_channel(
         &mut self,
-        us: mio::Token,
-        our_nick: &Nick,
+        us: UserId,
         channel: &ChannelName,
         msg: &str,
-    ) -> Vec<Output> {
+    ) -> Vec<OutputUser> {
         let mut output = Vec::with_capacity(32);
 
         let id = self.store.load_channel(channel);
@@ -528,20 +543,18 @@ impl System {
                 continue;
             }
 
-            output.push(o(
-                unimplemented!("*other_token"),
-                format!(":{}!~@irc PRIVMSG {} :{}", our_nick, channel, msg),
+            output.push(u(
+                us,
+                *other_id,
+                format!("PRIVMSG {} :{}", channel, msg),
             ));
         }
 
         output
     }
 
-    fn on_board(&mut self, token: mio::Token, account_id: AccountId, user: User) -> Vec<Output> {
-        let on_boarding = send_on_boarding(&user.nick)
-            .into_iter()
-            .map(|line| o(token, line))
-            .collect();
+    fn on_board(&mut self, token: mio::Token, account_id: AccountId, user: User) -> Vec<String> {
+        let on_boarding = send_on_boarding(&user.nick);
 
         assert!(
             self.registering.remove(&token).is_some(),
@@ -566,38 +579,37 @@ impl System {
         on_boarding
     }
 
-    fn joined(&mut self, us: mio::Token, chan: &ChannelName) -> Vec<Output> {
+    fn joined(&mut self, us: UserId, chan: &ChannelName) -> Vec<OutputUser> {
         let mut output = Vec::with_capacity(32);
         let id = self.store.load_channel(chan);
 
         let nick = {
-            let client = self
-                .clients
+            let user = self
+                .users
                 .get_mut(&us)
-                .expect("client generating event should exist");
-            if !unimplemented!("client.channels.insert(id)") {
-                return Vec::new();
+                .expect("user generating event should exist");
+            if !user.channels.insert(id) {
+                return vec![];
             }
-            unimplemented!("client.nick.to_string()")
+            user.nick.to_string()
         };
-
-        let nick = "unimplemented!";
 
         // client joins, 322 topic, 333 topic who/time, 353 users, 366 end of names
 
         // send everyone the join message
-        for (other_token, other_client) in &self.clients {
-            if unimplemented!("!other_client.channels.contains(&id)") {
+        for (other_id, other_user) in &self.users {
+            if !other_user.channels.contains(&id) {
                 continue;
             }
-            output.push(o(*other_token, format!(":{}!~@irc JOIN {}", nick, chan)));
+            output.push(u(us, *other_id, format!("JOIN {}", chan)));
         }
 
         // send us some details
-        output.push(o(
+        output.push(u(
+            UID_SERVER,
             us,
             format!(
-                ":ircd 332 {} {} :This topic intentionally left blank.",
+                "332 {} {} :This topic intentionally left blank.",
                 nick, chan
             ),
         ));
@@ -605,18 +617,19 @@ impl System {
         // TODO: client modes in a channel
 
         for names in wrapped(
-            self.clients
+            self.users
                 .values()
-                .filter(|client| unimplemented!("client.channels.contains(&id)"))
-                .map(|client| unimplemented!("client.nick.as_ref()")),
+                .filter(|user| user.channels.contains(&id))
+                .map(|user| user.nick.as_ref()),
         ) {
-            output.push(o(
+            output.push(u(
+                UID_SERVER,
                 us,
-                format!(":ircd 353 {} @ {} :{} {}", nick, chan, nick, names),
+                format!("353 {} @ {} :{} {}", nick, chan, nick, names),
             ));
         }
 
-        output.push(o(us, format!(":ircd 366 {} {} :</names>", nick, chan)));
+        output.push(u(UID_SERVER, us, format!("366 {} {} :</names>", nick, chan)));
 
         output
     }
@@ -673,6 +686,30 @@ fn unpack_command(command: Result<Command, &'static str>) -> Result<Vec<Req>, Cl
                 "unrecognised or mis-parsed command",
             ))
         }
+    }
+}
+
+fn render_error(err: ClientError) -> (bool, String) {
+    // TODO: Arguments for error codes are dependent on the code, making this ALL WRONG
+    match err {
+        ClientError::Die => (
+            true,
+            "999 * :You angered us in some way, sorry. Bye.".to_string(),
+        ),
+        ClientError::ErrorNickReason(code, msg) | ClientError::ErrorReason(code, msg) => {
+            (false, format!("{:03} * :{}", code.into_numeric(), msg))
+        }
+        ClientError::FatalReason(code, msg) => {
+            (true, format!("{:03} * :{}", code.into_numeric(), msg))
+        }
+        ClientError::ErrorNickWordReason(code, word, msg) => (
+            false,
+            format!(":ircd {:03} * {} :{}", code.into_numeric(), word, msg),
+        ),
+        ClientError::ErrorWordReason(code, word, msg) => (
+            false,
+            format!(":ircd {:03} {} :{}", code.into_numeric(), word, msg),
+        ),
     }
 }
 
