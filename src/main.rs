@@ -23,7 +23,6 @@ use std::fmt;
 
 use failure::Error;
 use failure::ResultExt;
-use maplit::hashset;
 use rand::Rng;
 
 use self::ids::ChannelName;
@@ -190,31 +189,17 @@ enum PreAuthOp {
 }
 
 struct Output {
-    token: mio::Token,
-    line: String,
+    from: UserId,
+    to: UserId,
+    tags: (),
+    cmd_and_args: String,
 
     /// Mmm. Trying to simplify 99% of the code which doesn't care.
     then_close: bool,
 }
 
-struct OutputUser {
-    from: UserId,
-    to: UserId,
-    tags: (),
-    cmd_and_args: String,
-    then_close: bool,
-}
-
-fn o<S: ToString>(token: mio::Token, message: S) -> Output {
+fn u<S: ToString>(from: UserId, to: UserId, cmd_and_args: S) -> Output {
     Output {
-        token,
-        line: message.to_string(),
-        then_close: false,
-    }
-}
-
-fn u<S: ToString>(from: UserId, to: UserId, cmd_and_args: S) -> OutputUser {
-    OutputUser {
         from,
         to,
         tags: (),
@@ -249,10 +234,10 @@ impl System {
             );
         }
 
-        for OutputUser {
+        for Output {
             from,
             to,
-            tags,
+            tags: (),
             cmd_and_args,
             then_close,
         } in output
@@ -293,26 +278,24 @@ impl System {
         }
     }
 
-    fn work_one(
-        &mut self,
-        us: mio::Token,
-        conn: &mut serv::Conn,
-        output: &mut Vec<OutputUser>,
-    ) -> () {
+    fn work_one(&mut self, us: mio::Token, conn: &mut serv::Conn, output: &mut Vec<Output>) -> () {
         for message in take_messages(conn) {
             let message = match message {
                 Ok(message) => message,
                 Err(e) => {
-                    output.push(unimplemented!("{:?}", render_error(e)));
-                    continue;
+                    unimplemented!(
+                        "need a way to directly return errors to the client: {:?}",
+                        e
+                    );
                 }
             };
 
             output.extend(if self.clients.contains_key(&us) {
                 self.work_client(us, message)
             } else {
-                self.work_pre_auth(us, message).into_iter()
-                    .map(|(fatal, msg)| OutputUser {
+                self.work_pre_auth(us, message)
+                    .into_iter()
+                    .map(|(fatal, msg)| Output {
                         // TODO: is either of these reasonable?
                         from: UID_SERVER,
                         to: UID_SERVER,
@@ -325,7 +308,7 @@ impl System {
         }
     }
 
-    fn work_client(&mut self, us: mio::Token, message: Message) -> Vec<OutputUser> {
+    fn work_client(&mut self, us: mio::Token, message: Message) -> Vec<Output> {
         let client = self.clients.get(&us).expect("just checked");
         assert_eq!(0, client.users.len(), "TODO: code cannot handle sub users");
 
@@ -337,31 +320,29 @@ impl System {
                 };
 
                 if user.nick != source_nick {
-                    return unimplemented!(
-                        r#"vec![self.render_error(
-                        ClientError::ErrorReason(
-                            ErrorCode::ErroneousNickname,
-                            "invalid input nickname",
+                    return vec![u(
+                        UID_SERVER,
+                        client.default_user,
+                        format!(
+                            "{:03} :no such user",
+                            ErrorCode::ErroneousNickname.into_numeric()
                         ),
-                        us,
-                    )]"#
-                    );
+                    )];
                 }
 
                 // TODO: else block here
                 client.default_user
             }
             Ok(None) => client.default_user,
-            Err(err) => {
-                return unimplemented!(
-                    r#"vec![self.render_error(
-                    ClientError::ErrorReason(
-                        ErrorCode::ErroneousNickname,
-                        "invalid hostmask nickname",
+            Err(_err) => {
+                return vec![u(
+                    UID_SERVER,
+                    client.default_user,
+                    format!(
+                        "{:03} :invalid hostmask nickname",
+                        ErrorCode::ErroneousNickname.into_numeric()
                     ),
-                    us,
-                )]"#
-                );
+                )];
             }
         };
 
@@ -373,13 +354,22 @@ impl System {
                     output.extend(self.work_req(user_id, req));
                 }
             }
-            Err(e) => unimplemented!("output.push(self.render_error(e, us))"),
+            Err(e) => {
+                let (then_close, cmd_and_args) = render_error(e);
+                output.push(Output {
+                    from: UID_SERVER,
+                    to: user_id,
+                    tags: (),
+                    cmd_and_args,
+                    then_close,
+                })
+            }
         }
 
         output
     }
 
-    fn work_req(&mut self, us: UserId, req: Req) -> Vec<OutputUser> {
+    fn work_req(&mut self, us: UserId, req: Req) -> Vec<Output> {
         self.translate_event(us, req)
     }
 
@@ -387,7 +377,11 @@ impl System {
     fn work_pre_auth(&mut self, us: mio::Token, message: Message) -> Vec<(bool, String)> {
         match self.translate_pre_auth(us, message) {
             PreAuthOp::Waiting => vec![],
-            PreAuthOp::Complete((account_id, client)) => self.on_board(us, account_id, client).into_iter().map(|m| (false, m)).collect(),
+            PreAuthOp::Complete((account_id, client)) => self
+                .on_board(us, account_id, client)
+                .into_iter()
+                .map(|m| (false, m))
+                .collect(),
             PreAuthOp::Ping(ref label) => vec![(false, render_ping(label))],
             PreAuthOp::Pong(ref label) => vec![(false, render_pong(label))],
             PreAuthOp::CapList => vec![(false, "CAP * LS :".to_string())],
@@ -395,13 +389,13 @@ impl System {
         }
     }
 
-    fn translate_event(&mut self, us: UserId, event: Req) -> Vec<OutputUser> {
+    fn translate_event(&mut self, us: UserId, event: Req) -> Vec<Output> {
         let mut output = Vec::with_capacity(4);
 
         match event {
-            Req::JoinChannel(ref channel) => output.extend(self.joined(us,channel)),
+            Req::JoinChannel(ref channel) => output.extend(self.joined(us, channel)),
             Req::MessageIndividual(other_nick, msg) => {
-                let to = match unimplemented!("self.lookup_user(&other_nick)") {
+                let to = match self.lookup_user(&other_nick) {
                     Some(user_id) => user_id,
                     None => {
                         return vec![u(
@@ -413,14 +407,21 @@ impl System {
                 };
                 output.push(u(us, to, format!("PRIVMSG {} :{}", other_nick, msg)))
             }
-            Req::MessageChannel(ref channel, ref msg) => output.extend(
-                self.message_channel(us, channel, msg)
-            ),
+            Req::MessageChannel(ref channel, ref msg) => {
+                output.extend(self.message_channel(us, channel, msg))
+            }
             Req::Ping(ref symbol) => output.push(u(UID_SERVER, us, render_ping(symbol))),
             Req::Pong(ref symbol) => output.push(u(UID_SERVER, us, render_pong(symbol))),
         }
 
         output
+    }
+
+    fn lookup_user(&self, nick: &Nick) -> Option<UserId> {
+        self.users
+            .iter()
+            .find(|(_, u)| u.nick == *nick)
+            .map(|(id, _)| *id)
     }
 
     /// https://modern.ircdocs.horse/#connection-registration
@@ -523,18 +524,13 @@ impl System {
         ))
     }
 
-    fn message_channel(
-        &mut self,
-        us: UserId,
-        channel: &ChannelName,
-        msg: &str,
-    ) -> Vec<OutputUser> {
+    fn message_channel(&mut self, us: UserId, channel: &ChannelName, msg: &str) -> Vec<Output> {
         let mut output = Vec::with_capacity(32);
 
         let id = self.store.load_channel(channel);
 
         for (other_id, other_user) in &self.users {
-            if *other_id == unimplemented!("us") {
+            if *other_id == us {
                 // don't message ourselves
                 continue;
             }
@@ -543,11 +539,7 @@ impl System {
                 continue;
             }
 
-            output.push(u(
-                us,
-                *other_id,
-                format!("PRIVMSG {} :{}", channel, msg),
-            ));
+            output.push(u(us, *other_id, format!("PRIVMSG {} :{}", channel, msg)));
         }
 
         output
@@ -579,7 +571,7 @@ impl System {
         on_boarding
     }
 
-    fn joined(&mut self, us: UserId, chan: &ChannelName) -> Vec<OutputUser> {
+    fn joined(&mut self, us: UserId, chan: &ChannelName) -> Vec<Output> {
         let mut output = Vec::with_capacity(32);
         let id = self.store.load_channel(chan);
 
@@ -629,7 +621,11 @@ impl System {
             ));
         }
 
-        output.push(u(UID_SERVER, us, format!("366 {} {} :</names>", nick, chan)));
+        output.push(u(
+            UID_SERVER,
+            us,
+            format!("366 {} {} :</names>", nick, chan),
+        ));
 
         output
     }

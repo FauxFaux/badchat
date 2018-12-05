@@ -66,12 +66,6 @@ impl Nick {
             inner: from.to_string(),
         })
     }
-
-    pub fn absent() -> Nick {
-        Nick {
-            inner: "*".to_string(),
-        }
-    }
 }
 
 impl ChannelName {
