@@ -11,11 +11,6 @@ extern crate rusqlite;
 extern crate rustls;
 extern crate vecio;
 
-mod ids;
-mod proto;
-mod serv;
-mod store;
-
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
@@ -30,6 +25,11 @@ use self::ids::HostMask;
 use self::ids::Nick;
 use self::proto::Command;
 use self::proto::ParsedMessage as Message;
+
+mod ids;
+mod proto;
+mod serv;
+mod store;
 
 type ConnId = mio::Token;
 
@@ -188,9 +188,16 @@ enum PreAuthOp {
     Error(ClientError),
 }
 
+#[derive(Copy, Clone, Debug)]
+enum FromTo {
+    ServerToClient(mio::Token),
+    ServerToUser(UserId),
+    UserToUser(UserId, UserId),
+}
+
+#[derive(Clone, Debug)]
 struct Output {
-    from: UserId,
-    to: UserId,
+    from_to: FromTo,
     tags: (),
     cmd_and_args: String,
 
@@ -200,8 +207,7 @@ struct Output {
 
 fn u<S: ToString>(from: UserId, to: UserId, cmd_and_args: S) -> Output {
     Output {
-        from,
-        to,
+        from_to: FromTo::UserToUser(from, to),
         tags: (),
         cmd_and_args: cmd_and_args.to_string(),
         then_close: false,
@@ -235,8 +241,7 @@ impl System {
         }
 
         for Output {
-            from,
-            to,
+            from_to,
             tags: (),
             cmd_and_args,
             then_close,
@@ -246,6 +251,11 @@ impl System {
                 Default(mio::Token),
                 An(mio::Token),
                 None,
+            };
+
+            let (from, to) = match from_to {
+                FromTo::UserToUser(from, to) => (from, to),
+                other => unimplemented!("from_to: {:?}", other),
             };
 
             let mut dest = Dest::None;
@@ -296,9 +306,7 @@ impl System {
                 self.work_pre_auth(us, message)
                     .into_iter()
                     .map(|(fatal, msg)| Output {
-                        // TODO: is either of these reasonable?
-                        from: UID_SERVER,
-                        to: UID_SERVER,
+                        from_to: FromTo::ServerToClient(us),
                         tags: (),
                         cmd_and_args: msg,
                         then_close: fatal,
@@ -357,8 +365,7 @@ impl System {
             Err(e) => {
                 let (then_close, cmd_and_args) = render_error(e);
                 output.push(Output {
-                    from: UID_SERVER,
-                    to: user_id,
+                    from_to: FromTo::ServerToUser(user_id),
                     tags: (),
                     cmd_and_args,
                     then_close,
@@ -402,7 +409,7 @@ impl System {
                             UID_SERVER,
                             us,
                             format!("{:03} :no such user", ErrorCode::NoSuchNick.into_numeric()),
-                        )]
+                        )];
                     }
                 };
                 output.push(u(us, to, format!("PRIVMSG {} :{}", other_nick, msg)))
@@ -444,7 +451,7 @@ impl System {
                         return PreAuthOp::Error(ClientError::ErrorNickReason(
                             ErrorCode::ErroneousNickname,
                             "invalid nickname; ascii letters, numbers, _. 2-12",
-                        ))
+                        ));
                     }
                 });
 
@@ -645,7 +652,7 @@ fn unpack_command(command: Result<Command, &'static str>) -> Result<Vec<Req>, Cl
                             ErrorCode::InvalidChannel,
                             "*",
                             "channel name invalid",
-                        ))
+                        ));
                     }
                 };
                 joins.push(Req::JoinChannel(chan));
