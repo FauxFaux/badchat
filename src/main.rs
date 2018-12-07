@@ -27,6 +27,7 @@ use self::proto::Command;
 use self::proto::ParsedMessage as Message;
 
 mod ids;
+mod pre;
 mod proto;
 mod serv;
 mod store;
@@ -35,6 +36,7 @@ type ConnId = mio::Token;
 
 const INPUT_LENGTH_LIMIT: usize = 4_096;
 
+#[derive(Debug, Copy, Clone)]
 struct PingToken(u64);
 
 impl Default for PingToken {
@@ -45,21 +47,20 @@ impl Default for PingToken {
 
 struct System {
     store: store::Store,
-    registering: HashMap<ConnId, PreAuth>,
     clients: HashMap<ConnId, Client>,
     users: HashMap<UserId, User>,
     next_user_id: u64,
 }
 
-#[derive(Copy, Clone, Eq, PartialEq)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
 enum PreAuthPing {
     WaitingForNick,
     WaitingForPong,
     Complete,
 }
 
-#[derive(Default)]
-struct PreAuth {
+#[derive(Debug, Default)]
+pub struct PreAuth {
     nick: Option<Nick>,
     pass: Option<String>,
     gecos: Option<(String, String)>,
@@ -93,10 +94,18 @@ pub struct ChannelId(i64);
 pub struct UserId(u64);
 
 #[derive(Debug)]
-struct Client {
-    account_id: AccountId,
-    default_user: UserId,
-    users: HashSet<UserId>,
+enum Client {
+    PreAuth {
+        state: PreAuth,
+    },
+    Singleton {
+        account_id: AccountId,
+        user_id: UserId,
+    },
+    MultiAware {
+        connection_account_id: AccountId,
+        users: HashSet<UserId>,
+    },
 }
 
 #[derive(Debug)]
@@ -179,15 +188,6 @@ enum ClientError {
     ErrorNickWordReason(ErrorCode, &'static str, &'static str),
 }
 
-enum PreAuthOp {
-    Waiting,
-    Complete((AccountId, User)),
-    Ping(String),
-    Pong(String),
-    CapList,
-    Error(ClientError),
-}
-
 #[derive(Copy, Clone, Debug)]
 enum FromTo {
     ServerToClient(mio::Token),
@@ -223,7 +223,6 @@ impl System {
             clients: HashMap::new(),
             users: HashMap::new(),
             next_user_id: UID_SERVER.0 + 1,
-            registering: HashMap::new(),
         })
     }
 
@@ -266,8 +265,11 @@ impl System {
             };
 
             for (token, client) in &self.clients {
-                if client.default_user == to {
-                    dest = Dest::Default(*token);
+                match client {
+                    Client::Singleton { user_id, .. } if *user_id == to => {
+                        dest = Dest::Default(*token);
+                    }
+                    _ => (),
                 }
             }
 
@@ -300,29 +302,76 @@ impl System {
                 }
             };
 
-            output.extend(if self.clients.contains_key(&us) {
-                self.work_client(us, message)
-            } else {
-                self.work_pre_auth(us, message)
-                    .into_iter()
-                    .map(|(fatal, msg)| Output {
-                        from_to: FromTo::ServerToClient(us),
-                        tags: (),
-                        cmd_and_args: msg,
-                        then_close: fatal,
-                    })
-                    .collect()
-            });
+            use self::pre::PreAuthOp;
+
+            let simple = match self.clients.entry(us).or_insert_with(|| Client::PreAuth {
+                state: PreAuth::default(),
+            }) {
+                Client::PreAuth { state } => {
+                    match pre::work_pre_auth(&message, state) {
+                        PreAuthOp::Done => {
+                            let nick = state.nick.as_ref().unwrap().clone();
+
+                            let account_id = AccountId(
+                                match self.store.user(&nick, state.pass.as_ref().unwrap()) {
+                                    Some(id) => id,
+                                    None => {
+                                        let err_msg = format!(
+                                            concat!(
+                                                "{:03} * :",
+                                                "Incorrect password for account. If you don't know",
+                                                " the password, you must use a different nick."
+                                            ),
+                                            ErrorCode::PasswordMismatch.into_numeric(),
+                                        );
+                                        unimplemented!("{}", err_msg);
+                                    }
+                                },
+                            );
+                            ((
+                                account_id,
+                                User {
+                                    nick,
+                                    host_mask: HostMask::new(),
+                                    channels: HashSet::new(),
+                                },
+                            ));
+                        }
+                        PreAuthOp::Output(messages) => {
+                            unimplemented!();
+                        }
+                        PreAuthOp::Error(msg) => output.push(Output {
+                            from_to: FromTo::ServerToClient(us),
+                            tags: (),
+                            cmd_and_args: msg,
+                            then_close: true,
+                        }),
+                    }
+
+                    None
+                }
+                Client::Singleton {
+                    account_id,
+                    user_id,
+                } => Some((*account_id, *user_id)),
+                Client::MultiAware { .. } => unimplemented!(),
+            };
+
+            if let Some((account_id, user_id)) = simple {
+                output.extend(self.work_client(account_id, user_id, message));
+            }
         }
     }
 
-    fn work_client(&mut self, us: mio::Token, message: Message) -> Vec<Output> {
-        let client = self.clients.get(&us).expect("just checked");
-        assert_eq!(0, client.users.len(), "TODO: code cannot handle sub users");
-
+    fn work_client(
+        &mut self,
+        account_id: AccountId,
+        user_id: UserId,
+        message: Message,
+    ) -> Vec<Output> {
         let user_id = match message.source_nick() {
             Ok(Some(source_nick)) => {
-                let user = match self.users.get(&client.default_user) {
+                let user = match self.users.get(&user_id) {
                     Some(user) => user,
                     None => unimplemented!("invalid default user?"),
                 };
@@ -330,7 +379,7 @@ impl System {
                 if user.nick != source_nick {
                     return vec![u(
                         UID_SERVER,
-                        client.default_user,
+                        user_id,
                         format!(
                             "{:03} :no such user",
                             ErrorCode::ErroneousNickname.into_numeric()
@@ -338,14 +387,13 @@ impl System {
                     )];
                 }
 
-                // TODO: else block here
-                client.default_user
+                user_id
             }
-            Ok(None) => client.default_user,
+            Ok(None) => user_id,
             Err(_err) => {
                 return vec![u(
                     UID_SERVER,
-                    client.default_user,
+                    user_id,
                     format!(
                         "{:03} :invalid hostmask nickname",
                         ErrorCode::ErroneousNickname.into_numeric()
@@ -381,20 +429,6 @@ impl System {
     }
 
     // TODO: Clearly this should be a Result<String, String>
-    fn work_pre_auth(&mut self, us: mio::Token, message: Message) -> Vec<(bool, String)> {
-        match self.translate_pre_auth(us, message) {
-            PreAuthOp::Waiting => vec![],
-            PreAuthOp::Complete((account_id, client)) => self
-                .on_board(us, account_id, client)
-                .into_iter()
-                .map(|m| (false, m))
-                .collect(),
-            PreAuthOp::Ping(ref label) => vec![(false, render_ping(label))],
-            PreAuthOp::Pong(ref label) => vec![(false, render_pong(label))],
-            PreAuthOp::CapList => vec![(false, "CAP * LS :".to_string())],
-            PreAuthOp::Error(eo) => vec![render_error(eo)],
-        }
-    }
 
     fn translate_event(&mut self, us: UserId, event: Req) -> Vec<Output> {
         let mut output = Vec::with_capacity(4);
@@ -431,106 +465,6 @@ impl System {
             .map(|(id, _)| *id)
     }
 
-    /// https://modern.ircdocs.horse/#connection-registration
-    fn translate_pre_auth(&mut self, token: mio::Token, message: Message) -> PreAuthOp {
-        let mut state = self.registering.entry(token).or_default();
-
-        match message.command() {
-            Ok(Command::CapLs(_version)) => {
-                state.sending_caps = true;
-                return PreAuthOp::CapList;
-            }
-            Ok(Command::CapEnd) => {
-                state.sending_caps = false;
-            }
-            Ok(Command::Pass(pass)) => state.pass = Some(pass.to_string()),
-            Ok(Command::Nick(nick)) => {
-                state.nick = Some(match Nick::new(nick) {
-                    Ok(nick) => nick,
-                    Err(_reason) => {
-                        return PreAuthOp::Error(ClientError::ErrorNickReason(
-                            ErrorCode::ErroneousNickname,
-                            "invalid nickname; ascii letters, numbers, _. 2-12",
-                        ));
-                    }
-                });
-
-                if state.ping == PreAuthPing::WaitingForNick {
-                    state.ping = PreAuthPing::WaitingForPong;
-                    return PreAuthOp::Ping(format!("{:08x}", state.ping_token.0));
-                }
-            }
-            Ok(Command::User(ident, _mode, real_name)) => {
-                state.gecos = Some((ident.to_string(), real_name.to_string()))
-            }
-            Ok(Command::Ping(arg)) => return PreAuthOp::Pong(arg.to_string()),
-            Ok(Command::Pong(ref arg))
-                if PreAuthPing::WaitingForPong == state.ping
-                    && u64::from_str_radix(arg, 16) == Ok(state.ping_token.0) =>
-            {
-                state.ping = PreAuthPing::Complete
-            }
-            Ok(Command::Other(ref raw, ..)) if is_http_verb(raw) => {
-                info!("http command on channel: {:?}", raw);
-                // TODO: is it worth sending them anything?
-                return PreAuthOp::Error(ClientError::Die);
-            }
-            Ok(Command::CapUnknown) => {
-                return PreAuthOp::Error(ClientError::ErrorNickWordReason(
-                    ErrorCode::InvalidCapCommand,
-                    "*",
-                    "invalid cap command",
-                ));
-            }
-            _other => {
-                return PreAuthOp::Error(ClientError::ErrorReason(
-                    ErrorCode::NotRegistered,
-                    "invalid pre-auth command",
-                ));
-            }
-        }
-
-        if !state.is_client_preamble_done() {
-            info!("waiting for more from client...");
-            return PreAuthOp::Waiting;
-        }
-
-        if state.pass.is_none() {
-            return PreAuthOp::Error(ClientError::FatalReason(
-                ErrorCode::PasswordMismatch,
-                concat!(
-                    "You must provide a password. ",
-                    "For an unregistered nick, any password is fine! ",
-                    "I'll just make you a new account."
-                ),
-            ));
-        }
-
-        let nick = state.nick.as_ref().unwrap().clone();
-
-        let account_id = AccountId(match self.store.user(&nick, state.pass.as_ref().unwrap()) {
-            Some(id) => id,
-            None => {
-                return PreAuthOp::Error(ClientError::FatalReason(
-                    ErrorCode::PasswordMismatch,
-                    concat!(
-                        "Incorrect password for account. If you don't know",
-                        " the password, you must use a different nick."
-                    ),
-                ));
-            }
-        });
-
-        PreAuthOp::Complete((
-            account_id,
-            User {
-                nick,
-                host_mask: HostMask::new(),
-                channels: HashSet::new(),
-            },
-        ))
-    }
-
     fn message_channel(&mut self, us: UserId, channel: &ChannelName, msg: &str) -> Vec<Output> {
         let mut output = Vec::with_capacity(32);
 
@@ -555,24 +489,18 @@ impl System {
     fn on_board(&mut self, token: mio::Token, account_id: AccountId, user: User) -> Vec<String> {
         let on_boarding = send_on_boarding(&user.nick);
 
-        assert!(
-            self.registering.remove(&token).is_some(),
-            "should be removing a registering client"
-        );
-
         let new_user = UserId(self.next_user_id);
         self.users.insert(new_user, user);
         self.next_user_id += 1;
 
-        let client = Client {
+        let client = Client::Singleton {
             account_id,
-            default_user: new_user,
-            users: HashSet::new(),
+            user_id: new_user,
         };
 
         assert!(
-            self.clients.insert(token, client).is_none(),
-            "shouldn't be replacing an existing client"
+            self.clients.insert(token, client).is_some(),
+            "should be replacing an existing client"
         );
 
         on_boarding
@@ -856,16 +784,6 @@ fn line_to_message(
             "Unable to parse your input as any form of message",
         )
     })?))
-}
-
-fn is_http_verb(word: &str) -> bool {
-    for verb in &["get", "connect", "post", "put", "delete", "patch"] {
-        if word.eq_ignore_ascii_case(verb) {
-            return true;
-        }
-    }
-
-    false
 }
 
 enum PoppedLine {
