@@ -183,14 +183,6 @@ enum Req {
     Pong(String),
 }
 
-#[derive(Debug, Copy, Clone)]
-enum ClientError {
-    ErrorReason(ErrorCode, &'static str),
-    ErrorNickReason(ErrorCode, &'static str),
-    ErrorWordReason(ErrorCode, &'static str, &'static str),
-    ErrorNickWordReason(ErrorCode, &'static str, &'static str),
-}
-
 #[derive(Copy, Clone, Debug)]
 enum FromTo {
     LinkManagement(mio::Token),
@@ -323,10 +315,7 @@ impl OutCommand {
     fn new<S: ToString, I: IntoIterator<Item = S>>(cmd: &'static str, args: I) -> OutCommand {
         OutCommand {
             cmd,
-            args: args
-                .into_iter()
-                .map(|s| s.to_string())
-                .collect(),
+            args: args.into_iter().map(|s| s.to_string()).collect(),
         }
     }
 
@@ -369,11 +358,14 @@ fn work_conn(
     for message in take_messages(conn) {
         let message = match message {
             Ok(message) => message,
-            Err(e) => {
-                unimplemented!(
-                    "need a way to directly return errors to the client: {:?}",
-                    e
-                );
+            Err((code, msg)) => {
+                output.push(Output {
+                    from_to: FromTo::LinkManagement(us),
+                    tags: (),
+                    cmd_and_args: OutCommand::new(code.into_numeric(), &[msg]),
+                    then_close: false,
+                });
+                continue;
             }
         };
 
@@ -536,23 +528,18 @@ fn work_single_client(
         }
     };
 
-    let mut output = Vec::with_capacity(4);
-
     match unpack_command(message.command()) {
-        Ok(reqs) => {
-            for req in reqs {
-                output.extend(work_req(store, users, user_id, req));
-            }
-        }
-        Err(cmd_and_args) => output.push(Output {
+        Ok(reqs) => reqs
+            .into_iter()
+            .flat_map(|req| work_req(store, users, user_id, req))
+            .collect(),
+        Err(cmd_and_args) => vec![Output {
             from_to: FromTo::ServerToUser(user_id),
             tags: (),
             cmd_and_args,
             then_close: false,
-        }),
+        }],
     }
-
-    output
 }
 
 fn work_req(store: &mut Store, users: &mut Users, us: UserId, req: Req) -> Vec<Output> {
@@ -765,7 +752,7 @@ fn wrapped<'i, I: IntoIterator<Item = &'i str>>(it: I) -> Vec<String> {
     blocks
 }
 
-fn take_messages(conn: &mut serv::Conn) -> Vec<Result<Message, ClientError>> {
+fn take_messages(conn: &mut serv::Conn) -> Vec<Result<Message, (ErrorCode, &'static str)>> {
     if conn.input.broken {
         match pop_line(&mut conn.input.buf) {
             PoppedLine::Done(_) | PoppedLine::TooLong => {
@@ -788,10 +775,7 @@ fn take_messages(conn: &mut serv::Conn) -> Vec<Result<Message, ClientError>> {
     }
 
     if conn.input.buf.len() > 10 * INPUT_LENGTH_LIMIT {
-        output.push(Err(ClientError::ErrorReason(
-            ErrorCode::LineTooLong,
-            "Your input buffer is full.",
-        )));
+        output.push(Err((ErrorCode::LineTooLong, "Your input buffer is full.")));
 
         conn.input.broken = true;
         conn.input.buf.clear();
@@ -842,12 +826,12 @@ fn send_on_boarding(nick: &str) -> Vec<OutCommand> {
 fn line_to_message(
     token: mio::Token,
     input_buffer: &mut VecDeque<u8>,
-) -> Result<Option<Message>, ClientError> {
+) -> Result<Option<Message>, (ErrorCode, &'static str)> {
     let line = match pop_line(input_buffer) {
         PoppedLine::Done(line) => line,
         PoppedLine::NotReady => return Ok(None),
         PoppedLine::TooLong => {
-            return Err(ClientError::ErrorReason(
+            return Err((
                 ErrorCode::LineTooLong,
                 "Your message was discarded as it was too long",
             ));
@@ -856,7 +840,7 @@ fn line_to_message(
 
     let line = String::from_utf8(line).map_err(|parse_error| {
         debug!("{:?}: {:?}", token, parse_error);
-        ClientError::ErrorReason(
+        (
             ErrorCode::BadCharEncoding,
             "Your line was discarded as it was not encoded using 'utf-8'",
         )
@@ -866,7 +850,7 @@ fn line_to_message(
 
     Ok(Some(proto::parse_message(line).map_err(|parse_error| {
         debug!("{:?}: bad command: {:?}", token, parse_error);
-        ClientError::ErrorReason(
+        (
             ErrorCode::UnknownError,
             "Unable to parse your input as any form of message",
         )
