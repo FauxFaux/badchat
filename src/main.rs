@@ -156,19 +156,19 @@ enum ErrorCode {
 }
 
 impl ErrorCode {
-    fn into_numeric(self) -> u16 {
+    fn into_numeric(self) -> &'static str {
         match self {
-            ErrorCode::UnknownError => 400,
-            ErrorCode::NoSuchNick => 403,
-            ErrorCode::InvalidChannel => 403,
-            ErrorCode::InvalidCapCommand => 410,
-            ErrorCode::LineTooLong => 419,
-            ErrorCode::UnknownCommand => 421,
-            ErrorCode::FileError => 424,
-            ErrorCode::ErroneousNickname => 432,
-            ErrorCode::NotRegistered => 451,
-            ErrorCode::PasswordMismatch => 451,
-            ErrorCode::BadCharEncoding => 980,
+            ErrorCode::UnknownError => "400",
+            ErrorCode::NoSuchNick => "403",
+            ErrorCode::InvalidChannel => "403",
+            ErrorCode::InvalidCapCommand => "410",
+            ErrorCode::LineTooLong => "419",
+            ErrorCode::UnknownCommand => "421",
+            ErrorCode::FileError => "424",
+            ErrorCode::ErroneousNickname => "432",
+            ErrorCode::NotRegistered => "451",
+            ErrorCode::PasswordMismatch => "451",
+            ErrorCode::BadCharEncoding => "980",
         }
     }
 }
@@ -184,8 +184,6 @@ enum Req {
 
 #[derive(Debug, Copy, Clone)]
 enum ClientError {
-    Die,
-    FatalReason(ErrorCode, &'static str),
     ErrorReason(ErrorCode, &'static str),
     ErrorNickReason(ErrorCode, &'static str),
     ErrorWordReason(ErrorCode, &'static str, &'static str),
@@ -200,20 +198,38 @@ enum FromTo {
 }
 
 #[derive(Clone, Debug)]
+enum OutArg {
+    String(String),
+    Nick,
+}
+
+#[derive(Clone, Debug)]
+struct OutCommand {
+    cmd: &'static str,
+    args: Vec<OutArg>,
+}
+
+#[derive(Clone, Debug)]
 struct Output {
     from_to: FromTo,
     tags: (),
-    cmd_and_args: String,
+    cmd_and_args: OutCommand,
 
     /// Mmm. Trying to simplify 99% of the code which doesn't care.
     then_close: bool,
 }
 
-fn u<S: ToString>(from: UserId, to: UserId, cmd_and_args: S) -> Output {
+#[inline]
+fn u<S: ToString, I: IntoIterator<Item = S>>(
+    from: UserId,
+    to: UserId,
+    cmd: &'static str,
+    args: I,
+) -> Output {
     Output {
         from_to: FromTo::UserToUser(from, to),
         tags: (),
-        cmd_and_args: cmd_and_args.to_string(),
+        cmd_and_args: OutCommand::new(cmd, args),
         then_close: false,
     }
 }
@@ -282,7 +298,7 @@ impl System {
             match dest {
                 Dest::Default(token) => {
                     if let Some(conn) = connections.get_mut(&token) {
-                        let line = format!(":{}!~@. {}", src.nick, cmd_and_args);
+                        let line = format!(":{}!~@. {}", src.nick, cmd_and_args.render());
                         if let Err(e) = conn.write_line(line) {
                             info!("{:?}: error sending normal message: {:?}", token, e);
                             conn.start_closing();
@@ -294,6 +310,54 @@ impl System {
                 _ => unimplemented!("unsupported dest"),
             }
         }
+    }
+}
+
+impl OutCommand {
+    fn new<S: ToString, I: IntoIterator<Item = S>>(cmd: &'static str, args: I) -> OutCommand {
+        OutCommand {
+            cmd,
+            args: args
+                .into_iter()
+                .map(|s| OutArg::String(s.to_string()))
+                .collect(),
+        }
+    }
+
+    fn render(&self) -> String {
+        if self.args.is_empty() {
+            return self.cmd.to_string();
+        }
+
+        let mut out = String::with_capacity(self.cmd.len() + self.args.len() * 6);
+        out.push_str(self.cmd);
+
+        for arg in &self.args[..self.args.len() - 1] {
+            out.push(' ');
+            match arg {
+                OutArg::String(s) => {
+                    assert!(!s.is_empty());
+                    assert!(!s.starts_with(':'));
+                    assert!(!s.contains(|c: char| c.is_whitespace()));
+                    out.push_str(&s);
+                }
+                OutArg::Nick => unimplemented!(),
+            }
+        }
+
+        let last_arg = &self.args[self.args.len() - 1];
+
+        out.push(' ');
+        out.push(':');
+
+        match last_arg {
+            OutArg::String(s) => {
+                out.push_str(&s);
+            }
+            OutArg::Nick => unimplemented!(),
+        }
+
+        out
     }
 }
 
@@ -421,10 +485,8 @@ fn work_single_client(
                 return vec![u(
                     UID_SERVER,
                     user_id,
-                    format!(
-                        "{:03} :no such user",
-                        ErrorCode::ErroneousNickname.into_numeric()
-                    ),
+                    ErrorCode::ErroneousNickname.into_numeric(),
+                    &["no such user"],
                 )];
             }
 
@@ -435,10 +497,8 @@ fn work_single_client(
             return vec![u(
                 UID_SERVER,
                 user_id,
-                format!(
-                    "{:03} :invalid hostmask nickname",
-                    ErrorCode::ErroneousNickname.into_numeric()
-                ),
+                ErrorCode::ErroneousNickname.into_numeric(),
+                &["invalid hostmask nickname"],
             )];
         }
     };
@@ -448,27 +508,24 @@ fn work_single_client(
     match unpack_command(message.command()) {
         Ok(reqs) => {
             for req in reqs {
-                output.extend(translate_event(store, users, user_id, req));
+                output.extend(work_req(store, users, user_id, req));
             }
         }
-        Err(e) => {
-            let (then_close, cmd_and_args) = render_error(e);
-            output.push(Output {
-                from_to: FromTo::ServerToUser(user_id),
-                tags: (),
-                cmd_and_args,
-                then_close,
-            })
-        }
+        Err(cmd_and_args) => output.push(Output {
+            from_to: FromTo::ServerToUser(user_id),
+            tags: (),
+            cmd_and_args,
+            then_close: false,
+        }),
     }
 
     output
 }
 
-fn translate_event(store: &mut Store, users: &mut Users, us: UserId, event: Req) -> Vec<Output> {
+fn work_req(store: &mut Store, users: &mut Users, us: UserId, req: Req) -> Vec<Output> {
     let mut output = Vec::with_capacity(4);
 
-    match event {
+    match req {
         Req::JoinChannel(ref channel) => output.extend(joined(store, users, us, channel)),
         Req::MessageIndividual(other_nick, msg) => {
             let to = match lookup_user(users, &other_nick) {
@@ -477,17 +534,18 @@ fn translate_event(store: &mut Store, users: &mut Users, us: UserId, event: Req)
                     return vec![u(
                         UID_SERVER,
                         us,
-                        format!("{:03} :no such user", ErrorCode::NoSuchNick.into_numeric()),
+                        ErrorCode::NoSuchNick.into_numeric(),
+                        &["no such user"],
                     )];
                 }
             };
-            output.push(u(us, to, format!("PRIVMSG {} :{}", other_nick, msg)))
+            output.push(u(us, to, "PRIVMSG", &[other_nick.to_string(), msg]));
         }
         Req::MessageChannel(ref channel, ref msg) => {
             output.extend(message_channel(store, users, us, channel, msg))
         }
-        Req::Ping(ref symbol) => output.push(u(UID_SERVER, us, render_ping(symbol))),
-        Req::Pong(ref symbol) => output.push(u(UID_SERVER, us, render_pong(symbol))),
+        Req::Ping(ref symbol) => output.push(u(UID_SERVER, us, "PONG", &[symbol])),
+        Req::Pong(_symbol) => (),
     }
 
     output
@@ -522,7 +580,7 @@ fn message_channel(
             continue;
         }
 
-        output.push(u(us, *other_id, format!("PRIVMSG {} :{}", channel, msg)));
+        output.push(u(us, *other_id, "PRIVMSG", &[&channel.to_string(), msg]));
     }
 
     output
@@ -570,17 +628,19 @@ fn joined(store: &mut Store, users: &mut Users, us: UserId, chan: &ChannelName) 
         if !other_user.channels.contains(&id) {
             continue;
         }
-        output.push(u(us, *other_id, format!("JOIN {}", chan)));
+        output.push(u(us, *other_id, "JOIN", &[chan]));
     }
 
     // send us some details
     output.push(u(
         UID_SERVER,
         us,
-        format!(
-            "332 {} {} :This topic intentionally left blank.",
-            nick, chan
-        ),
+        "332",
+        &[
+            &nick,
+            &chan.to_string(),
+            "This topic intentionally left blank.",
+        ],
     ));
     // @: secret channel (+s)
     // TODO: client modes in a channel
@@ -594,20 +654,27 @@ fn joined(store: &mut Store, users: &mut Users, us: UserId, chan: &ChannelName) 
         output.push(u(
             UID_SERVER,
             us,
-            format!("353 {} @ {} :{} {}", nick, chan, nick, names),
+            "353",
+            &[
+                nick.to_string(),
+                "@".to_string(),
+                chan.to_string(),
+                format!("{} {}", nick, names),
+            ],
         ));
     }
 
     output.push(u(
         UID_SERVER,
         us,
-        format!("366 {} {} :</names>", nick, chan),
+        "366",
+        &[nick, chan.to_string(), "</names>".to_string()],
     ));
 
     output
 }
 
-fn unpack_command(command: Result<Command, &'static str>) -> Result<Vec<Req>, ClientError> {
+fn unpack_command(command: Result<Command, &'static str>) -> Result<Vec<Req>, OutCommand> {
     match command {
         Ok(Command::Join(ref chan, ref keys, ref real_name))
             if keys.is_none() && real_name.is_none() =>
@@ -617,10 +684,9 @@ fn unpack_command(command: Result<Command, &'static str>) -> Result<Vec<Req>, Cl
                 let chan = match ChannelName::new(chan.trim().to_string()) {
                     Ok(chan) => chan,
                     Err(_reason) => {
-                        return Err(ClientError::ErrorWordReason(
-                            ErrorCode::InvalidChannel,
-                            "*",
-                            "channel name invalid",
+                        return Err(OutCommand::new(
+                            ErrorCode::InvalidChannel.into_numeric(),
+                            &["*", "channel name invalid"],
                         ));
                     }
                 };
@@ -632,19 +698,17 @@ fn unpack_command(command: Result<Command, &'static str>) -> Result<Vec<Req>, Cl
             if dest.starts_with('#') {
                 match ChannelName::new(dest) {
                     Ok(chan) => Ok(vec![Req::MessageChannel(chan, msg.to_string())]),
-                    Err(_reason) => Err(ClientError::ErrorWordReason(
-                        ErrorCode::NoSuchNick,
-                        "*",
-                        "invalid channel",
+                    Err(_reason) => Err(OutCommand::new(
+                        ErrorCode::NoSuchNick.into_numeric(),
+                        &["*", "invalid channel"],
                     )),
                 }
             } else {
                 match Nick::new(dest) {
                     Ok(nick) => Ok(vec![Req::MessageIndividual(nick, msg.to_string())]),
-                    Err(_reason) => Err(ClientError::ErrorWordReason(
-                        ErrorCode::NoSuchNick,
-                        "*",
-                        "invalid channel or nickname",
+                    Err(_reason) => Err(OutCommand::new(
+                        ErrorCode::NoSuchNick.into_numeric(),
+                        &["*", "invalid channel or nickname"],
                     )),
                 }
             }
@@ -653,35 +717,11 @@ fn unpack_command(command: Result<Command, &'static str>) -> Result<Vec<Req>, Cl
         Ok(Command::Pong(..)) => Ok(vec![]),
         other => {
             info!("invalid command: {:?}", other);
-            Err(ClientError::ErrorNickReason(
-                ErrorCode::UnknownCommand,
-                "unrecognised or mis-parsed command",
+            Err(OutCommand::new(
+                ErrorCode::UnknownCommand.into_numeric(),
+                &["unrecognised or mis-parsed command"],
             ))
         }
-    }
-}
-
-fn render_error(err: ClientError) -> (bool, String) {
-    // TODO: Arguments for error codes are dependent on the code, making this ALL WRONG
-    match err {
-        ClientError::Die => (
-            true,
-            "999 * :You angered us in some way, sorry. Bye.".to_string(),
-        ),
-        ClientError::ErrorNickReason(code, msg) | ClientError::ErrorReason(code, msg) => {
-            (false, format!("{:03} * :{}", code.into_numeric(), msg))
-        }
-        ClientError::FatalReason(code, msg) => {
-            (true, format!("{:03} * :{}", code.into_numeric(), msg))
-        }
-        ClientError::ErrorNickWordReason(code, word, msg) => (
-            false,
-            format!(":ircd {:03} * {} :{}", code.into_numeric(), word, msg),
-        ),
-        ClientError::ErrorWordReason(code, word, msg) => (
-            false,
-            format!(":ircd {:03} {} :{}", code.into_numeric(), word, msg),
-        ),
     }
 }
 
@@ -748,14 +788,6 @@ fn take_messages(conn: &mut serv::Conn) -> Vec<Result<Message, ClientError>> {
     }
 
     output
-}
-
-fn render_ping(label: &str) -> String {
-    format!("PING :{}", label)
-}
-
-fn render_pong(label: &str) -> String {
-    format!("PONG :{}", label)
 }
 
 fn send_on_boarding<D: fmt::Display>(nick: D) -> Vec<String> {
