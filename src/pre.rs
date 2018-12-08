@@ -20,7 +20,10 @@ pub fn work_pre_auth(message: &Message, state: &mut PreAuth) -> PreAuthOp {
     match message.command() {
         Ok(Command::CapLs(_version)) => {
             state.sending_caps = true;
-            return PreAuthOp::Output(vec![OutCommand::new("CAP", &["*", "LS", ""])]);
+            return PreAuthOp::Output(vec![OutCommand::new(
+                "CAP",
+                &["*", "LS", "draft/message-tags-0.2 server-time"],
+            )]);
         }
         Ok(Command::CapEnd) => {
             state.sending_caps = false;
