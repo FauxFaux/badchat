@@ -234,7 +234,7 @@ impl System {
         let mut output = Vec::with_capacity(4 * tokens.len());
 
         for token in tokens {
-            work_one(
+            output.extend(work_conn(
                 &mut self.store,
                 &mut self.clients,
                 &mut self.users,
@@ -242,8 +242,7 @@ impl System {
                 connections
                     .get_mut(token)
                     .expect("server said there was work for a connection, but it's gone"),
-                &mut output,
-            );
+            ));
         }
 
         for Output {
@@ -298,14 +297,15 @@ impl System {
     }
 }
 
-fn work_one(
+fn work_conn(
     store: &mut Store,
     clients: &mut Clients,
     users: &mut Users,
     us: mio::Token,
     conn: &mut serv::Conn,
-    output: &mut Vec<Output>,
-) -> () {
+) -> Vec<Output> {
+    let mut output = Vec::with_capacity(4);
+
     for message in take_messages(conn) {
         let message = match message {
             Ok(message) => message,
@@ -317,67 +317,93 @@ fn work_one(
             }
         };
 
-        use self::pre::PreAuthOp;
-
-        let simple = match clients.entry(us).or_insert_with(|| Client::PreAuth {
-            state: PreAuth::default(),
-        }) {
-            Client::PreAuth { state } => {
-                match pre::work_pre_auth(&message, state) {
-                    PreAuthOp::Done => {
-                        let nick = state.nick.as_ref().unwrap().clone();
-
-                        let account_id =
-                            AccountId(match store.user(&nick, state.pass.as_ref().unwrap()) {
-                                Some(id) => id,
-                                None => {
-                                    let err_msg = format!(
-                                        concat!(
-                                            "{:03} * :",
-                                            "Incorrect password for account. If you don't know",
-                                            " the password, you must use a different nick."
-                                        ),
-                                        ErrorCode::PasswordMismatch.into_numeric(),
-                                    );
-                                    unimplemented!("{}", err_msg);
-                                }
-                            });
-                        ((
-                            account_id,
-                            User {
-                                nick,
-                                host_mask: HostMask::new(),
-                                channels: HashSet::new(),
-                            },
-                        ));
-                    }
-                    PreAuthOp::Output(messages) => {
-                        unimplemented!();
-                    }
-                    PreAuthOp::Error(msg) => output.push(Output {
-                        from_to: FromTo::ServerToClient(us),
-                        tags: (),
-                        cmd_and_args: msg,
-                        then_close: true,
-                    }),
-                }
-
-                None
-            }
-            Client::Singleton {
-                account_id,
-                user_id,
-            } => Some((*account_id, *user_id)),
-            Client::MultiAware { .. } => unimplemented!(),
-        };
-
-        if let Some((account_id, user_id)) = simple {
-            output.extend(work_client(store, users, account_id, user_id, message));
-        }
+        output.extend(work_client(
+            store,
+            users,
+            us,
+            clients.entry(us).or_insert_with(|| Client::PreAuth {
+                state: PreAuth::default(),
+            }),
+            message,
+        ));
     }
+
+    output
 }
 
 fn work_client(
+    store: &mut Store,
+    users: &mut Users,
+    us: mio::Token,
+    client: &mut Client,
+    message: Message,
+) -> Vec<Output> {
+    let mut output = Vec::with_capacity(4);
+
+    use self::pre::PreAuthOp;
+
+    match client {
+        Client::PreAuth { state } => match pre::work_pre_auth(&message, state) {
+            PreAuthOp::Done => {
+                let nick = state.nick.as_ref().unwrap().clone();
+
+                let account_id = AccountId(match store.user(&nick, state.pass.as_ref().unwrap()) {
+                    Some(id) => id,
+                    None => {
+                        let err_msg = format!(
+                            concat!(
+                                "{:03} * :",
+                                "Incorrect password for account. If you don't know",
+                                " the password, you must use a different nick."
+                            ),
+                            ErrorCode::PasswordMismatch.into_numeric(),
+                        );
+                        unimplemented!("{}", err_msg);
+                    }
+                });
+
+                *client = Client::Singleton {
+                    account_id,
+                    user_id: unimplemented!(),
+                };
+                ((
+                    account_id,
+                    User {
+                        nick,
+                        host_mask: HostMask::new(),
+                        channels: HashSet::new(),
+                    },
+                ));
+            }
+            PreAuthOp::Output(messages) => {
+                unimplemented!("actual output: {:?}", messages);
+            }
+            PreAuthOp::Error(msg) => output.push(Output {
+                from_to: FromTo::ServerToClient(us),
+                tags: (),
+                cmd_and_args: msg,
+                then_close: true,
+            }),
+        },
+        Client::Singleton {
+            account_id,
+            user_id,
+        } => {
+            output.extend(work_single_client(
+                store,
+                users,
+                *account_id,
+                *user_id,
+                message,
+            ));
+        }
+        Client::MultiAware { .. } => unimplemented!(),
+    }
+
+    output
+}
+
+fn work_single_client(
     store: &mut Store,
     users: &mut Users,
     account_id: AccountId,
@@ -438,8 +464,6 @@ fn work_client(
 
     output
 }
-
-// TODO: Clearly this should be a Result<String, String>
 
 fn translate_event(store: &mut Store, users: &mut Users, us: UserId, event: Req) -> Vec<Output> {
     let mut output = Vec::with_capacity(4);

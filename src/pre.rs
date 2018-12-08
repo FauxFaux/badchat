@@ -1,15 +1,10 @@
-use crate::ids::HostMask;
 use crate::ids::Nick;
 use crate::proto::Command;
 use crate::proto::ParsedMessage as Message;
-use crate::AccountId;
-use crate::ClientError;
 use crate::ErrorCode;
 use crate::PreAuth;
 use crate::PreAuthPing;
-use crate::User;
 
-use crate::render_error;
 use crate::render_ping;
 use crate::render_pong;
 
