@@ -181,7 +181,6 @@ enum Req {
     JoinChannel(ChannelName),
     MessageChannel(ChannelName, String),
     MessageIndividual(Nick, String),
-    Ping(String),
     Pong(String),
 }
 
@@ -195,6 +194,7 @@ enum ClientError {
 
 #[derive(Copy, Clone, Debug)]
 enum FromTo {
+    LinkManagement(mio::Token),
     ServerToClient(mio::Token),
     ServerToUser(UserId),
     UserToUser(UserId, UserId),
@@ -277,7 +277,7 @@ impl System {
                 FromTo::UserToUser(_, to) | FromTo::ServerToUser(to) => {
                     find_user(&self.clients, to)
                 }
-                FromTo::ServerToClient(client) => client,
+                FromTo::ServerToClient(client) | FromTo::LinkManagement(client) => client,
             };
 
             let prefix = match from_to {
@@ -285,8 +285,8 @@ impl System {
                     ":{}!~@. ",
                     self.users.data.get(&from).expect("valid src user").nick
                 ),
-                FromTo::ServerToUser(_) => ":ircd ".to_string(),
-                FromTo::ServerToClient(_) => String::new(),
+                FromTo::ServerToUser(_) | FromTo::ServerToClient(_) => ":ircd ".to_string(),
+                FromTo::LinkManagement(_) => String::new(),
             };
 
             let conn = connections.get_mut(&dest).expect("valid dest");
@@ -385,6 +385,19 @@ fn work_conn(
             }
         };
 
+        match message.command() {
+            Ok(Command::Ping(symbol)) => {
+                output.push(Output {
+                    from_to: FromTo::LinkManagement(us),
+                    tags: (),
+                    cmd_and_args: OutCommand::new("PONG", &[symbol]),
+                    then_close: false,
+                });
+                continue;
+            }
+            _ => (),
+        }
+
         output.extend(work_client(
             store,
             users,
@@ -407,6 +420,8 @@ fn work_client(
     message: Message,
 ) -> Vec<Output> {
     use self::pre::PreAuthOp;
+
+    info!("{:?}: work_client: {:?} - {:?}", us, client, message);
 
     match client {
         Client::PreAuth { state } => match pre::work_pre_auth(&message, state) {
@@ -474,6 +489,12 @@ fn work_client(
                     })
                     .collect();
             }
+            PreAuthOp::Ping(symbol) => vec![Output {
+                from_to: FromTo::LinkManagement(us),
+                tags: (),
+                cmd_and_args: OutCommand::new("PING", &[format!("{:08x}", symbol.0)]),
+                then_close: false,
+            }],
             PreAuthOp::Error(msg) => vec![Output {
                 from_to: FromTo::ServerToClient(us),
                 tags: (),
@@ -566,7 +587,6 @@ fn work_req(store: &mut Store, users: &mut Users, us: UserId, req: Req) -> Vec<O
         Req::MessageChannel(ref channel, ref msg) => {
             output.extend(message_channel(store, users, us, channel, msg))
         }
-        Req::Ping(ref symbol) => output.push(u(UID_SERVER, us, "PONG", &[symbol])),
         Req::Pong(_symbol) => (),
     }
 
@@ -717,7 +737,7 @@ fn unpack_command(command: Result<Command, &'static str>) -> Result<Vec<Req>, Ou
                 }
             }
         }
-        Ok(Command::Ping(arg)) => Ok(vec![Req::Pong(arg.to_string())]),
+        Ok(Command::Ping(_)) => unreachable!("ping handled as link management"),
         Ok(Command::Pong(..)) => Ok(vec![]),
         other => {
             info!("invalid command: {:?}", other);

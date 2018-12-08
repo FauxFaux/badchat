@@ -3,6 +3,7 @@ use crate::proto::Command;
 use crate::proto::ParsedMessage as Message;
 use crate::ErrorCode;
 use crate::OutCommand;
+use crate::PingToken;
 use crate::PreAuth;
 use crate::PreAuthPing;
 
@@ -11,6 +12,7 @@ pub enum PreAuthOp {
     Done,
     Output(Vec<OutCommand>),
     Error(OutCommand),
+    Ping(PingToken),
 }
 
 /// https://modern.ircdocs.horse/#connection-registration
@@ -37,16 +39,12 @@ pub fn work_pre_auth(message: &Message, state: &mut PreAuth) -> PreAuthOp {
 
             if state.ping == PreAuthPing::WaitingForNick {
                 state.ping = PreAuthPing::WaitingForPong;
-                return PreAuthOp::Output(vec![OutCommand::new(
-                    "PING",
-                    &[format!("{:08x}", state.ping_token.0)],
-                )]);
+                return PreAuthOp::Ping(state.ping_token);
             }
         }
         Ok(Command::User(ident, _mode, real_name)) => {
             state.gecos = Some((ident.to_string(), real_name.to_string()))
         }
-        Ok(Command::Ping(arg)) => return PreAuthOp::Output(vec![OutCommand::new("PONG", &[arg])]),
         Ok(Command::Pong(ref arg))
             if PreAuthPing::WaitingForPong == state.ping
                 && u64::from_str_radix(arg, 16) == Ok(state.ping_token.0) =>
@@ -64,6 +62,7 @@ pub fn work_pre_auth(message: &Message, state: &mut PreAuth) -> PreAuthOp {
                 &["*", "*", "invalid cap command"],
             )]);
         }
+        Ok(Command::Ping(_)) => unreachable!("ping handled as link management"),
         _other => {
             return PreAuthOp::Output(vec![OutCommand::new(
                 ErrorCode::NotRegistered.into_numeric(),

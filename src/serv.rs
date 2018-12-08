@@ -159,8 +159,6 @@ impl Conn {
     fn handle_readiness(&mut self, readiness: mio::Ready) -> Result<bool, Error> {
         let mut new_input = false;
 
-        trace!("{:?} woke up: {:?}", self.net.token, readiness);
-
         match &mut self.extra {
             ConnType::Plain(output) => {
                 if readiness.is_readable() {
@@ -421,8 +419,6 @@ pub fn serve_forever<F: FnMut(&HashSet<Token>, &mut Connections)>(
 
         // handle accepting and reading/writing data from/to active connections
         for event in events.iter() {
-            trace!("event: {:?}: {:?}", event.token(), event.readiness());
-
             let token = event.token();
             if let Some(server) = servers.get_mut(&token) {
                 last_id += 1;
