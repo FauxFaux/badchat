@@ -5,3 +5,5 @@
 localhost.crt
 localhost.key
 badchat.db
+*.db-shm
+*.db-wal

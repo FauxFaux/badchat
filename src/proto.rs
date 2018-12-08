@@ -55,7 +55,7 @@ pub fn parse_message(from: String) -> Result<ParsedMessage, &'static str> {
 
     // TODO: colours
     // Perfectly happy with this eliminating tab, etc.
-    if from.contains(|c: char| c.is_ascii_control()) {
+    if from.contains(|c: char| !allowed_char(c)) {
         return Err("banned characters");
     }
 
@@ -114,6 +114,21 @@ pub fn parse_message(from: String) -> Result<ParsedMessage, &'static str> {
         cmd,
         args,
     })
+}
+
+#[inline]
+fn allowed_char(c: char) -> bool {
+    match c {
+        '\x01' => true, // /me
+        '\x02' => true, // bold
+        '\x03' => true, // colour
+        '\x0f' => true, // reset formatting
+        '\x16' => true, // invert
+        '\x1d' => true, // italic
+        '\x1f' => true, // underlined
+        o if o >= ' ' => true,
+        _ => false,
+    }
 }
 
 impl ParsedMessage {

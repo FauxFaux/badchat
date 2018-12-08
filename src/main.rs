@@ -274,21 +274,27 @@ impl System {
             };
 
             let prefix = match from_to {
-                FromTo::UserToUser(from, _) => format!(
-                    ":{}!~@. ",
-                    self.users.data.get(&from).expect("valid src user").nick
-                ),
+                FromTo::UserToUser(from, _) => match self.users.data.get(&from) {
+                    Some(user) => format!(":{}!~@. ", user.nick),
+                    None => {
+                        warn!("invalid-user: {:?} from from_to: {:?}", from, from_to);
+                        continue;
+                    }
+                },
                 FromTo::ServerToUser(_) | FromTo::ServerToClient(_) => ":ircd ".to_string(),
                 FromTo::LinkManagement(_) => String::new(),
             };
 
-            let conn = connections.get_mut(&dest).expect("valid dest");
-            let line = format!("{}{}", prefix, cmd_and_args.render());
-            if let Err(e) = conn.write_line(line) {
-                info!("{:?}: error sending normal message: {:?}", dest, e);
-                conn.start_closing();
-            } else if then_close {
-                conn.start_closing();
+            if let Some(conn) = connections.get_mut(&dest) {
+                let line = format!("{}{}", prefix, cmd_and_args.render());
+                if let Err(e) = conn.write_line(line) {
+                    info!("{:?}: error sending normal message: {:?}", dest, e);
+                    conn.start_closing();
+                } else if then_close {
+                    conn.start_closing();
+                }
+            } else {
+                warn!("invalid-dest: {:?} from from_to: {:?}", dest, from_to);
             }
         }
     }
@@ -580,7 +586,6 @@ fn lookup_user(users: &Users, nick: &Nick) -> Option<UserId> {
 fn message_channel(
     store: &mut Store,
     users: &Users,
-
     us: UserId,
     channel: &ChannelName,
     msg: &str,
