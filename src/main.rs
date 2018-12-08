@@ -26,6 +26,7 @@ use self::proto::Command;
 use self::proto::ParsedMessage as Message;
 use self::store::Store;
 
+mod err;
 mod ids;
 mod pre;
 mod proto;
@@ -119,60 +120,6 @@ struct User {
     nick: Nick,
     host_mask: HostMask,
     channels: HashSet<ChannelId>,
-}
-
-#[derive(Copy, Clone, Debug)]
-enum ErrorCode {
-    // RFC1459, sending it for parse errors, and [..]
-    UnknownError,
-
-    // RFC1459, sending it for invalid message targets
-    NoSuchNick,
-
-    // RFC1459, sending it for invalid channel names
-    InvalidChannel,
-
-    // irv3.1, using as intended, but maybe don't have the full mandatory support
-    InvalidCapCommand,
-
-    // "length truncated" in aircd. Like with encoding, we're just rejecting
-    LineTooLong,
-
-    // RFC1459, but we also send it for some parse errors
-    UnknownCommand,
-
-    // RFC1459, sent for internal errors processing commands
-    FileError,
-
-    // RFC1459, possibly used as intended!
-    ErroneousNickname,
-
-    // RFC1459, including invalid pre-auth command parsing
-    NotRegistered,
-
-    // RFC1459, including pass missing
-    PasswordMismatch,
-
-    // KineIRCd. Most IRCds pass-through. I don't agree.
-    BadCharEncoding,
-}
-
-impl ErrorCode {
-    fn into_numeric(self) -> &'static str {
-        match self {
-            ErrorCode::UnknownError => "400",
-            ErrorCode::NoSuchNick => "403",
-            ErrorCode::InvalidChannel => "403",
-            ErrorCode::InvalidCapCommand => "410",
-            ErrorCode::LineTooLong => "419",
-            ErrorCode::UnknownCommand => "421",
-            ErrorCode::FileError => "424",
-            ErrorCode::ErroneousNickname => "432",
-            ErrorCode::NotRegistered => "451",
-            ErrorCode::PasswordMismatch => "451",
-            ErrorCode::BadCharEncoding => "980",
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -364,11 +311,11 @@ fn work_conn(
     for message in take_messages(conn) {
         let message = match message {
             Ok(message) => message,
-            Err((code, msg)) => {
+            Err(cmd_and_args) => {
                 output.push(Output {
                     from_to: FromTo::LinkManagement(us),
                     tags: (),
-                    cmd_and_args: OutCommand::new(code.into_numeric(), &[msg]),
+                    cmd_and_args,
                     then_close: false,
                 });
                 continue;
@@ -424,16 +371,10 @@ fn work_client(
                         return vec![Output {
                             from_to: FromTo::ServerToClient(us),
                             tags: (),
-                            cmd_and_args: OutCommand::new(
-                                ErrorCode::PasswordMismatch.into_numeric(),
-                                &[
-                                    "*",
-                                    concat!(
-                                        "Incorrect password for account. If you don't know",
-                                        " the password, you must use a different nick."
-                                    ),
-                                ],
-                            ),
+                            cmd_and_args: err::password_mismatch(concat!(
+                                "Incorrect password for account. If you don't know",
+                                " the password, you must use a different nick."
+                            )),
                             then_close: true,
                         }];
                     }
@@ -515,22 +456,24 @@ fn work_single_client(
             };
 
             if user.nick != source_nick {
-                return vec![s2u(
-                    user_id,
-                    ErrorCode::ErroneousNickname.into_numeric(),
-                    &["no such user"],
-                )];
+                return vec![Output {
+                    from_to: FromTo::ServerToUser(user_id),
+                    tags: (),
+                    cmd_and_args: err::erroneous_nickname(source_nick.to_string(), "no such user"),
+                    then_close: false,
+                }];
             }
 
             user_id
         }
         Ok(None) => user_id,
         Err(_err) => {
-            return vec![s2u(
-                user_id,
-                ErrorCode::ErroneousNickname.into_numeric(),
-                &["invalid hostmask nickname"],
-            )];
+            return vec![Output {
+                from_to: FromTo::ServerToUser(user_id),
+                tags: (),
+                cmd_and_args: err::erroneous_nickname("*".to_string(), "invalid hostmask nickname"),
+                then_close: false,
+            }];
         }
     };
 
@@ -557,11 +500,12 @@ fn work_req(store: &mut Store, users: &mut Users, us: UserId, req: Req) -> Vec<O
             let to = match lookup_user(users, &other_nick) {
                 Some(user_id) => user_id,
                 None => {
-                    return vec![s2u(
-                        us,
-                        ErrorCode::NoSuchNick.into_numeric(),
-                        &["no such user"],
-                    )];
+                    return vec![Output {
+                        from_to: FromTo::ServerToUser(us),
+                        tags: (),
+                        cmd_and_args: err::no_such_nick(other_nick.to_string(), "no such user"),
+                        then_close: false,
+                    }];
                 }
             };
             output.push(u(us, to, "PRIVMSG", &[other_nick.to_string(), msg]));
@@ -683,13 +627,11 @@ fn unpack_command(command: Result<Command, &'static str>) -> Result<Vec<Req>, Ou
         {
             let mut joins = Vec::with_capacity(4);
             for chan in chan.split(',') {
-                let chan = match ChannelName::new(chan.trim().to_string()) {
+                let chan = chan.trim().to_string();
+                let chan = match ChannelName::new(&chan) {
                     Ok(chan) => chan,
                     Err(_reason) => {
-                        return Err(OutCommand::new(
-                            ErrorCode::InvalidChannel.into_numeric(),
-                            &["*", "channel name invalid"],
-                        ));
+                        return Err(err::no_such_channel(chan, "channel name invalid"));
                     }
                 };
                 joins.push(Req::JoinChannel(chan));
@@ -700,17 +642,14 @@ fn unpack_command(command: Result<Command, &'static str>) -> Result<Vec<Req>, Ou
             if dest.starts_with('#') {
                 match ChannelName::new(dest) {
                     Ok(chan) => Ok(vec![Req::MessageChannel(chan, msg.to_string())]),
-                    Err(_reason) => Err(OutCommand::new(
-                        ErrorCode::NoSuchNick.into_numeric(),
-                        &["*", "invalid channel"],
-                    )),
+                    Err(_reason) => Err(err::no_such_channel(dest.to_string(), "invalid channel")),
                 }
             } else {
                 match Nick::new(dest) {
                     Ok(nick) => Ok(vec![Req::MessageIndividual(nick, msg.to_string())]),
-                    Err(_reason) => Err(OutCommand::new(
-                        ErrorCode::NoSuchNick.into_numeric(),
-                        &["*", "invalid channel or nickname"],
+                    Err(_reason) => Err(err::no_such_nick(
+                        dest.to_string(),
+                        "invalid channel or nickname",
                     )),
                 }
             }
@@ -719,9 +658,9 @@ fn unpack_command(command: Result<Command, &'static str>) -> Result<Vec<Req>, Ou
         Ok(Command::Pong(..)) => Ok(vec![]),
         other => {
             info!("invalid command: {:?}", other);
-            Err(OutCommand::new(
-                ErrorCode::UnknownCommand.into_numeric(),
-                &["unrecognised or mis-parsed command"],
+            Err(err::unknown_command(
+                "*".to_string(),
+                "unrecognised or mis-parsed command",
             ))
         }
     }
@@ -757,7 +696,7 @@ fn wrapped<'i, I: IntoIterator<Item = &'i str>>(it: I) -> Vec<String> {
     blocks
 }
 
-fn take_messages(conn: &mut serv::Conn) -> Vec<Result<Message, (ErrorCode, &'static str)>> {
+fn take_messages(conn: &mut serv::Conn) -> Vec<Result<Message, OutCommand>> {
     if conn.input.broken {
         match pop_line(&mut conn.input.buf) {
             PoppedLine::Done(_) | PoppedLine::TooLong => {
@@ -780,7 +719,7 @@ fn take_messages(conn: &mut serv::Conn) -> Vec<Result<Message, (ErrorCode, &'sta
     }
 
     if conn.input.buf.len() > 10 * INPUT_LENGTH_LIMIT {
-        output.push(Err((ErrorCode::LineTooLong, "Your input buffer is full.")));
+        output.push(Err(err::line_too_long("Your input buffer is full.")));
 
         conn.input.broken = true;
         conn.input.buf.clear();
@@ -831,13 +770,12 @@ fn send_on_boarding(nick: &str) -> Vec<OutCommand> {
 fn line_to_message(
     token: mio::Token,
     input_buffer: &mut VecDeque<u8>,
-) -> Result<Option<Message>, (ErrorCode, &'static str)> {
+) -> Result<Option<Message>, OutCommand> {
     let line = match pop_line(input_buffer) {
         PoppedLine::Done(line) => line,
         PoppedLine::NotReady => return Ok(None),
         PoppedLine::TooLong => {
-            return Err((
-                ErrorCode::LineTooLong,
+            return Err(err::line_too_long(
                 "Your message was discarded as it was too long",
             ));
         }
@@ -845,8 +783,8 @@ fn line_to_message(
 
     let line = String::from_utf8(line).map_err(|parse_error| {
         debug!("{:?}: {:?}", token, parse_error);
-        (
-            ErrorCode::BadCharEncoding,
+        err::bad_char_encoding(
+            "*".to_string(),
             "Your line was discarded as it was not encoded using 'utf-8'",
         )
     })?;
@@ -855,10 +793,7 @@ fn line_to_message(
 
     Ok(Some(proto::parse_message(line).map_err(|parse_error| {
         debug!("{:?}: bad command: {:?}", token, parse_error);
-        (
-            ErrorCode::UnknownError,
-            "Unable to parse your input as any form of message",
-        )
+        err::unknown_error("Unable to parse your input as any form of message")
     })?))
 }
 
