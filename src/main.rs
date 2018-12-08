@@ -47,13 +47,16 @@ impl Default for PingToken {
 }
 
 type Clients = HashMap<ConnId, Client>;
-type Users = HashMap<UserId, User>;
+
+struct Users {
+    data: HashMap<UserId, User>,
+    next: u64,
+}
 
 struct System {
     store: Store,
     clients: Clients,
     users: Users,
-    next_user_id: u64,
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -241,8 +244,10 @@ impl System {
         Ok(System {
             store: store::Store::new()?,
             clients: HashMap::new(),
-            users: HashMap::new(),
-            next_user_id: UID_SERVER.0 + 1,
+            users: Users {
+                data: HashMap::new(),
+                next: UID_SERVER.0 + 1,
+            },
         })
     }
 
@@ -281,7 +286,7 @@ impl System {
 
             let mut dest = Dest::None;
 
-            let src = match self.users.get(&from) {
+            let src = match self.users.data.get(&from) {
                 Some(src) => src,
                 None => unimplemented!("missing user.. disconnected, or server"),
             };
@@ -402,8 +407,6 @@ fn work_client(
     client: &mut Client,
     message: Message,
 ) -> Vec<Output> {
-    let mut output = Vec::with_capacity(4);
-
     use self::pre::PreAuthOp;
 
     match client {
@@ -414,57 +417,77 @@ fn work_client(
                 let account_id = AccountId(match store.user(&nick, state.pass.as_ref().unwrap()) {
                     Some(id) => id,
                     None => {
-                        let err_msg = format!(
-                            concat!(
-                                "{:03} * :",
-                                "Incorrect password for account. If you don't know",
-                                " the password, you must use a different nick."
+                        return vec![Output {
+                            from_to: FromTo::ServerToClient(us),
+                            tags: (),
+                            cmd_and_args: OutCommand::new(
+                                ErrorCode::PasswordMismatch.into_numeric(),
+                                &[
+                                    "*",
+                                    concat!(
+                                        "Incorrect password for account. If you don't know",
+                                        " the password, you must use a different nick."
+                                    ),
+                                ],
                             ),
-                            ErrorCode::PasswordMismatch.into_numeric(),
-                        );
-                        unimplemented!("{}", err_msg);
+                            then_close: true,
+                        }];
                     }
                 });
 
+                let user_id = UserId(users.next);
+                users.next += 1;
+
                 *client = Client::Singleton {
                     account_id,
-                    user_id: unimplemented!(),
+                    user_id,
                 };
-                ((
-                    account_id,
+
+                let on_boarding = send_on_boarding(&nick.to_string());
+
+                users.data.insert(
+                    user_id,
                     User {
                         nick,
                         host_mask: HostMask::new(),
                         channels: HashSet::new(),
                     },
-                ));
+                );
+
+                on_boarding
+                    .into_iter()
+                    .map(|cmd_and_args| Output {
+                        from_to: FromTo::ServerToUser(user_id),
+                        tags: (),
+                        cmd_and_args,
+                        then_close: false,
+                    })
+                    .collect()
             }
             PreAuthOp::Output(messages) => {
-                unimplemented!("actual output: {:?}", messages);
+                return messages
+                    .into_iter()
+                    .map(|cmd_and_args| Output {
+                        from_to: FromTo::ServerToClient(us),
+                        tags: (),
+                        cmd_and_args,
+                        then_close: false,
+                    })
+                    .collect();
             }
-            PreAuthOp::Error(msg) => output.push(Output {
+            PreAuthOp::Error(msg) => vec![Output {
                 from_to: FromTo::ServerToClient(us),
                 tags: (),
                 cmd_and_args: msg,
                 then_close: true,
-            }),
+            }],
         },
         Client::Singleton {
             account_id,
             user_id,
-        } => {
-            output.extend(work_single_client(
-                store,
-                users,
-                *account_id,
-                *user_id,
-                message,
-            ));
-        }
+        } => work_single_client(store, users, *account_id, *user_id, message),
         Client::MultiAware { .. } => unimplemented!(),
     }
-
-    output
 }
 
 fn work_single_client(
@@ -476,7 +499,7 @@ fn work_single_client(
 ) -> Vec<Output> {
     let user_id = match message.source_nick() {
         Ok(Some(source_nick)) => {
-            let user = match users.get(&user_id) {
+            let user = match users.data.get(&user_id) {
                 Some(user) => user,
                 None => unimplemented!("invalid default user?"),
             };
@@ -553,6 +576,7 @@ fn work_req(store: &mut Store, users: &mut Users, us: UserId, req: Req) -> Vec<O
 
 fn lookup_user(users: &Users, nick: &Nick) -> Option<UserId> {
     users
+        .data
         .iter()
         .find(|(_, u)| u.nick == *nick)
         .map(|(id, _)| *id)
@@ -570,7 +594,7 @@ fn message_channel(
 
     let id = store.load_channel(channel);
 
-    for (other_id, other_user) in users.iter() {
+    for (other_id, other_user) in users.data.iter() {
         if *other_id == us {
             // don't message ourselves
             continue;
@@ -586,33 +610,13 @@ fn message_channel(
     output
 }
 
-#[cfg(never)]
-fn on_board(token: mio::Token, account_id: AccountId, user: User) -> Vec<String> {
-    let on_boarding = send_on_boarding(&user.nick);
-
-    let new_user = UserId(self.next_user_id);
-    self.users.insert(new_user, user);
-    self.next_user_id += 1;
-
-    let client = Client::Singleton {
-        account_id,
-        user_id: new_user,
-    };
-
-    assert!(
-        self.clients.insert(token, client).is_some(),
-        "should be replacing an existing client"
-    );
-
-    on_boarding
-}
-
 fn joined(store: &mut Store, users: &mut Users, us: UserId, chan: &ChannelName) -> Vec<Output> {
     let mut output = Vec::with_capacity(32);
     let id = store.load_channel(chan);
 
     let nick = {
         let user = users
+            .data
             .get_mut(&us)
             .expect("user generating event should exist");
         if !user.channels.insert(id) {
@@ -624,7 +628,7 @@ fn joined(store: &mut Store, users: &mut Users, us: UserId, chan: &ChannelName) 
     // client joins, 322 topic, 333 topic who/time, 353 users, 366 end of names
 
     // send everyone the join message
-    for (other_id, other_user) in users.iter() {
+    for (other_id, other_user) in users.data.iter() {
         if !other_user.channels.contains(&id) {
             continue;
         }
@@ -647,6 +651,7 @@ fn joined(store: &mut Store, users: &mut Users, us: UserId, chan: &ChannelName) 
 
     for names in wrapped(
         users
+            .data
             .values()
             .filter(|user| user.channels.contains(&id))
             .map(|user| user.nick.as_ref()),
@@ -790,37 +795,41 @@ fn take_messages(conn: &mut serv::Conn) -> Vec<Result<Message, ClientError>> {
     output
 }
 
-fn send_on_boarding<D: fmt::Display>(nick: D) -> Vec<String> {
+fn send_on_boarding(nick: &str) -> Vec<OutCommand> {
     let mut output = Vec::with_capacity(16);
 
     // This is all legacy garbage. Trying to get any possible client to continue the connection.
 
     // Minimal hello.
-    output.push(format!(":ircd 001 {} :Hi!", nick));
-    output.push(format!(":ircd 002 {} :This is IRC.", nick));
-    output.push(format!(":ircd 003 {} :This server is.", nick));
-    output.push(format!(":ircd 004 {} ircd badchat iZ s", nick));
-    output.push(format!(
-        ":ircd 005 {} SAFELIST :are supported by this server",
-        nick
+    output.push(OutCommand::new("001", &[nick, "Hi!"]));
+    output.push(OutCommand::new("002", &[nick, "This is IRC."]));
+    output.push(OutCommand::new("003", &[nick, "This server is."]));
+    output.push(OutCommand::new("004", &[nick, "ircd badchat iZ s"]));
+    output.push(OutCommand::new(
+        "005",
+        &[nick, "SAFELIST", "are supported by this server"],
     ));
 
     // Minimal LUSERS
-    output.push(format!(":ircd 251 {} :There are users.", nick));
-    output.push(format!(":ircd 254 {} 69 :channels formed", nick));
-    output.push(format!(":ircd 255 {} :I have clients and servers.", nick));
-    output.push(format!(
-        ":ircd 265 {} 69 69 :Current local users are nice.",
-        nick
+    output.push(OutCommand::new("251", &[nick, "There are users."]));
+    output.push(OutCommand::new("254", &[nick, "69", "channels formed"]));
+    output.push(OutCommand::new(
+        "255",
+        &[nick, "I have clients and servers."],
+    ));
+    output.push(OutCommand::new(
+        "265",
+        &[nick, "69", "69", "Current local users are nice."],
     ));
 
     // Minimal MOTD
-    output.push(format!(
-        ":ircd 422 {} :MOTDs haven't been cool for decades.",
-        nick
+    output.push(OutCommand::new(
+        "422",
+        &[nick, "MOTDs haven't been cool for decades."],
     ));
 
-    output.push(format!(":{} MODE {0} :+iZ", nick));
+    // TODO: should the user be setting this on themselves, not the server doing it?
+    output.push(OutCommand::new("MODE", &[nick, "+iZ"]));
 
     output
 }
