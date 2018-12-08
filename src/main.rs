@@ -237,7 +237,15 @@ fn u<S: ToString, I: IntoIterator<Item = S>>(
     }
 }
 
-const UID_SERVER: UserId = UserId(0);
+#[inline]
+fn s2u<S: ToString, I: IntoIterator<Item = S>>(to: UserId, cmd: &'static str, args: I) -> Output {
+    Output {
+        from_to: FromTo::ServerToUser(to),
+        tags: (),
+        cmd_and_args: OutCommand::new(cmd, args),
+        then_close: false,
+    }
+}
 
 impl System {
     fn new() -> Result<System, Error> {
@@ -246,7 +254,7 @@ impl System {
             clients: HashMap::new(),
             users: Users {
                 data: HashMap::new(),
-                next: UID_SERVER.0 + 1,
+                next: 0,
             },
         })
     }
@@ -318,6 +326,7 @@ fn find_user(clients: &Clients, which: UserId) -> mio::Token {
 }
 
 impl OutCommand {
+    #[inline]
     fn new<S: ToString, I: IntoIterator<Item = S>>(cmd: &'static str, args: I) -> OutCommand {
         OutCommand {
             cmd,
@@ -525,8 +534,7 @@ fn work_single_client(
             };
 
             if user.nick != source_nick {
-                return vec![u(
-                    UID_SERVER,
+                return vec![s2u(
                     user_id,
                     ErrorCode::ErroneousNickname.into_numeric(),
                     &["no such user"],
@@ -537,8 +545,7 @@ fn work_single_client(
         }
         Ok(None) => user_id,
         Err(_err) => {
-            return vec![u(
-                UID_SERVER,
+            return vec![s2u(
                 user_id,
                 ErrorCode::ErroneousNickname.into_numeric(),
                 &["invalid hostmask nickname"],
@@ -574,8 +581,7 @@ fn work_req(store: &mut Store, users: &mut Users, us: UserId, req: Req) -> Vec<O
             let to = match lookup_user(users, &other_nick) {
                 Some(user_id) => user_id,
                 None => {
-                    return vec![u(
-                        UID_SERVER,
+                    return vec![s2u(
                         us,
                         ErrorCode::NoSuchNick.into_numeric(),
                         &["no such user"],
@@ -655,8 +661,7 @@ fn joined(store: &mut Store, users: &mut Users, us: UserId, chan: &ChannelName) 
     }
 
     // send us some details
-    output.push(u(
-        UID_SERVER,
+    output.push(s2u(
         us,
         "332",
         &[
@@ -675,8 +680,7 @@ fn joined(store: &mut Store, users: &mut Users, us: UserId, chan: &ChannelName) 
             .filter(|user| user.channels.contains(&id))
             .map(|user| user.nick.as_ref()),
     ) {
-        output.push(u(
-            UID_SERVER,
+        output.push(s2u(
             us,
             "353",
             &[
@@ -688,8 +692,7 @@ fn joined(store: &mut Store, users: &mut Users, us: UserId, chan: &ChannelName) 
         ));
     }
 
-    output.push(u(
-        UID_SERVER,
+    output.push(s2u(
         us,
         "366",
         &[nick, chan.to_string(), "</names>".to_string()],
