@@ -273,49 +273,48 @@ impl System {
             then_close,
         } in output
         {
-            enum Dest {
-                Default(mio::Token),
-                An(mio::Token),
-                None,
-            };
-
-            let (from, to) = match from_to {
-                FromTo::UserToUser(from, to) => (from, to),
-                other => unimplemented!("from_to: {:?}", other),
-            };
-
-            let mut dest = Dest::None;
-
-            let src = match self.users.data.get(&from) {
-                Some(src) => src,
-                None => unimplemented!("missing user.. disconnected, or server"),
-            };
-
-            for (token, client) in &self.clients {
-                match client {
-                    Client::Singleton { user_id, .. } if *user_id == to => {
-                        dest = Dest::Default(*token);
-                    }
-                    _ => (),
+            let dest = match from_to {
+                FromTo::UserToUser(_, to) | FromTo::ServerToUser(to) => {
+                    find_user(&self.clients, to)
                 }
-            }
+                FromTo::ServerToClient(client) => client,
+            };
 
-            match dest {
-                Dest::Default(token) => {
-                    if let Some(conn) = connections.get_mut(&token) {
-                        let line = format!(":{}!~@. {}", src.nick, cmd_and_args.render());
-                        if let Err(e) = conn.write_line(line) {
-                            info!("{:?}: error sending normal message: {:?}", token, e);
-                            conn.start_closing();
-                        } else if then_close {
-                            conn.start_closing();
-                        }
-                    }
-                }
-                _ => unimplemented!("unsupported dest"),
+            let prefix = match from_to {
+                FromTo::UserToUser(from, _) => format!(
+                    ":{}!~@. ",
+                    self.users.data.get(&from).expect("valid src user").nick
+                ),
+                FromTo::ServerToUser(_) => ":ircd ".to_string(),
+                FromTo::ServerToClient(_) => String::new(),
+            };
+
+            let conn = connections.get_mut(&dest).expect("valid dest");
+            let line = format!("{}{}", prefix, cmd_and_args.render());
+            if let Err(e) = conn.write_line(line) {
+                info!("{:?}: error sending normal message: {:?}", dest, e);
+                conn.start_closing();
+            } else if then_close {
+                conn.start_closing();
             }
         }
     }
+}
+
+fn find_user(clients: &Clients, which: UserId) -> mio::Token {
+    for (token, client) in clients {
+        match client {
+            Client::PreAuth { .. } => unreachable!("pre-auth can't user->user"),
+            Client::Singleton { user_id, .. } => {
+                if *user_id == which {
+                    return *token;
+                }
+            }
+            Client::MultiAware { .. } => unimplemented!("multi-aware client"),
+        }
+    }
+
+    unimplemented!("no client has user_id: {:?}", which);
 }
 
 impl OutCommand {
