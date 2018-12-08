@@ -25,6 +25,7 @@ use self::ids::HostMask;
 use self::ids::Nick;
 use self::proto::Command;
 use self::proto::ParsedMessage as Message;
+use self::store::Store;
 
 mod ids;
 mod pre;
@@ -45,10 +46,13 @@ impl Default for PingToken {
     }
 }
 
+type Clients = HashMap<ConnId, Client>;
+type Users = HashMap<UserId, User>;
+
 struct System {
-    store: store::Store,
-    clients: HashMap<ConnId, Client>,
-    users: HashMap<UserId, User>,
+    store: Store,
+    clients: Clients,
+    users: Users,
     next_user_id: u64,
 }
 
@@ -230,7 +234,10 @@ impl System {
         let mut output = Vec::with_capacity(4 * tokens.len());
 
         for token in tokens {
-            self.work_one(
+            work_one(
+                &mut self.store,
+                &mut self.clients,
+                &mut self.users,
                 *token,
                 connections
                     .get_mut(token)
@@ -289,281 +296,291 @@ impl System {
             }
         }
     }
+}
 
-    fn work_one(&mut self, us: mio::Token, conn: &mut serv::Conn, output: &mut Vec<Output>) -> () {
-        for message in take_messages(conn) {
-            let message = match message {
-                Ok(message) => message,
-                Err(e) => {
-                    unimplemented!(
-                        "need a way to directly return errors to the client: {:?}",
-                        e
-                    );
-                }
-            };
-
-            use self::pre::PreAuthOp;
-
-            let simple = match self.clients.entry(us).or_insert_with(|| Client::PreAuth {
-                state: PreAuth::default(),
-            }) {
-                Client::PreAuth { state } => {
-                    match pre::work_pre_auth(&message, state) {
-                        PreAuthOp::Done => {
-                            let nick = state.nick.as_ref().unwrap().clone();
-
-                            let account_id = AccountId(
-                                match self.store.user(&nick, state.pass.as_ref().unwrap()) {
-                                    Some(id) => id,
-                                    None => {
-                                        let err_msg = format!(
-                                            concat!(
-                                                "{:03} * :",
-                                                "Incorrect password for account. If you don't know",
-                                                " the password, you must use a different nick."
-                                            ),
-                                            ErrorCode::PasswordMismatch.into_numeric(),
-                                        );
-                                        unimplemented!("{}", err_msg);
-                                    }
-                                },
-                            );
-                            ((
-                                account_id,
-                                User {
-                                    nick,
-                                    host_mask: HostMask::new(),
-                                    channels: HashSet::new(),
-                                },
-                            ));
-                        }
-                        PreAuthOp::Output(messages) => {
-                            unimplemented!();
-                        }
-                        PreAuthOp::Error(msg) => output.push(Output {
-                            from_to: FromTo::ServerToClient(us),
-                            tags: (),
-                            cmd_and_args: msg,
-                            then_close: true,
-                        }),
-                    }
-
-                    None
-                }
-                Client::Singleton {
-                    account_id,
-                    user_id,
-                } => Some((*account_id, *user_id)),
-                Client::MultiAware { .. } => unimplemented!(),
-            };
-
-            if let Some((account_id, user_id)) = simple {
-                output.extend(self.work_client(account_id, user_id, message));
+fn work_one(
+    store: &mut Store,
+    clients: &mut Clients,
+    users: &mut Users,
+    us: mio::Token,
+    conn: &mut serv::Conn,
+    output: &mut Vec<Output>,
+) -> () {
+    for message in take_messages(conn) {
+        let message = match message {
+            Ok(message) => message,
+            Err(e) => {
+                unimplemented!(
+                    "need a way to directly return errors to the client: {:?}",
+                    e
+                );
             }
+        };
+
+        use self::pre::PreAuthOp;
+
+        let simple = match clients.entry(us).or_insert_with(|| Client::PreAuth {
+            state: PreAuth::default(),
+        }) {
+            Client::PreAuth { state } => {
+                match pre::work_pre_auth(&message, state) {
+                    PreAuthOp::Done => {
+                        let nick = state.nick.as_ref().unwrap().clone();
+
+                        let account_id =
+                            AccountId(match store.user(&nick, state.pass.as_ref().unwrap()) {
+                                Some(id) => id,
+                                None => {
+                                    let err_msg = format!(
+                                        concat!(
+                                            "{:03} * :",
+                                            "Incorrect password for account. If you don't know",
+                                            " the password, you must use a different nick."
+                                        ),
+                                        ErrorCode::PasswordMismatch.into_numeric(),
+                                    );
+                                    unimplemented!("{}", err_msg);
+                                }
+                            });
+                        ((
+                            account_id,
+                            User {
+                                nick,
+                                host_mask: HostMask::new(),
+                                channels: HashSet::new(),
+                            },
+                        ));
+                    }
+                    PreAuthOp::Output(messages) => {
+                        unimplemented!();
+                    }
+                    PreAuthOp::Error(msg) => output.push(Output {
+                        from_to: FromTo::ServerToClient(us),
+                        tags: (),
+                        cmd_and_args: msg,
+                        then_close: true,
+                    }),
+                }
+
+                None
+            }
+            Client::Singleton {
+                account_id,
+                user_id,
+            } => Some((*account_id, *user_id)),
+            Client::MultiAware { .. } => unimplemented!(),
+        };
+
+        if let Some((account_id, user_id)) = simple {
+            output.extend(work_client(store, users, account_id, user_id, message));
         }
     }
+}
 
-    fn work_client(
-        &mut self,
-        account_id: AccountId,
-        user_id: UserId,
-        message: Message,
-    ) -> Vec<Output> {
-        let user_id = match message.source_nick() {
-            Ok(Some(source_nick)) => {
-                let user = match self.users.get(&user_id) {
-                    Some(user) => user,
-                    None => unimplemented!("invalid default user?"),
-                };
+fn work_client(
+    store: &mut Store,
+    users: &mut Users,
+    account_id: AccountId,
+    user_id: UserId,
+    message: Message,
+) -> Vec<Output> {
+    let user_id = match message.source_nick() {
+        Ok(Some(source_nick)) => {
+            let user = match users.get(&user_id) {
+                Some(user) => user,
+                None => unimplemented!("invalid default user?"),
+            };
 
-                if user.nick != source_nick {
-                    return vec![u(
-                        UID_SERVER,
-                        user_id,
-                        format!(
-                            "{:03} :no such user",
-                            ErrorCode::ErroneousNickname.into_numeric()
-                        ),
-                    )];
-                }
-
-                user_id
-            }
-            Ok(None) => user_id,
-            Err(_err) => {
+            if user.nick != source_nick {
                 return vec![u(
                     UID_SERVER,
                     user_id,
                     format!(
-                        "{:03} :invalid hostmask nickname",
+                        "{:03} :no such user",
                         ErrorCode::ErroneousNickname.into_numeric()
                     ),
                 )];
             }
-        };
 
-        let mut output = Vec::with_capacity(4);
-
-        match unpack_command(message.command()) {
-            Ok(reqs) => {
-                for req in reqs {
-                    output.extend(self.work_req(user_id, req));
-                }
-            }
-            Err(e) => {
-                let (then_close, cmd_and_args) = render_error(e);
-                output.push(Output {
-                    from_to: FromTo::ServerToUser(user_id),
-                    tags: (),
-                    cmd_and_args,
-                    then_close,
-                })
-            }
+            user_id
         }
-
-        output
-    }
-
-    fn work_req(&mut self, us: UserId, req: Req) -> Vec<Output> {
-        self.translate_event(us, req)
-    }
-
-    // TODO: Clearly this should be a Result<String, String>
-
-    fn translate_event(&mut self, us: UserId, event: Req) -> Vec<Output> {
-        let mut output = Vec::with_capacity(4);
-
-        match event {
-            Req::JoinChannel(ref channel) => output.extend(self.joined(us, channel)),
-            Req::MessageIndividual(other_nick, msg) => {
-                let to = match self.lookup_user(&other_nick) {
-                    Some(user_id) => user_id,
-                    None => {
-                        return vec![u(
-                            UID_SERVER,
-                            us,
-                            format!("{:03} :no such user", ErrorCode::NoSuchNick.into_numeric()),
-                        )];
-                    }
-                };
-                output.push(u(us, to, format!("PRIVMSG {} :{}", other_nick, msg)))
-            }
-            Req::MessageChannel(ref channel, ref msg) => {
-                output.extend(self.message_channel(us, channel, msg))
-            }
-            Req::Ping(ref symbol) => output.push(u(UID_SERVER, us, render_ping(symbol))),
-            Req::Pong(ref symbol) => output.push(u(UID_SERVER, us, render_pong(symbol))),
-        }
-
-        output
-    }
-
-    fn lookup_user(&self, nick: &Nick) -> Option<UserId> {
-        self.users
-            .iter()
-            .find(|(_, u)| u.nick == *nick)
-            .map(|(id, _)| *id)
-    }
-
-    fn message_channel(&mut self, us: UserId, channel: &ChannelName, msg: &str) -> Vec<Output> {
-        let mut output = Vec::with_capacity(32);
-
-        let id = self.store.load_channel(channel);
-
-        for (other_id, other_user) in &self.users {
-            if *other_id == us {
-                // don't message ourselves
-                continue;
-            }
-
-            if !other_user.channels.contains(&id) {
-                continue;
-            }
-
-            output.push(u(us, *other_id, format!("PRIVMSG {} :{}", channel, msg)));
-        }
-
-        output
-    }
-
-    fn on_board(&mut self, token: mio::Token, account_id: AccountId, user: User) -> Vec<String> {
-        let on_boarding = send_on_boarding(&user.nick);
-
-        let new_user = UserId(self.next_user_id);
-        self.users.insert(new_user, user);
-        self.next_user_id += 1;
-
-        let client = Client::Singleton {
-            account_id,
-            user_id: new_user,
-        };
-
-        assert!(
-            self.clients.insert(token, client).is_some(),
-            "should be replacing an existing client"
-        );
-
-        on_boarding
-    }
-
-    fn joined(&mut self, us: UserId, chan: &ChannelName) -> Vec<Output> {
-        let mut output = Vec::with_capacity(32);
-        let id = self.store.load_channel(chan);
-
-        let nick = {
-            let user = self
-                .users
-                .get_mut(&us)
-                .expect("user generating event should exist");
-            if !user.channels.insert(id) {
-                return vec![];
-            }
-            user.nick.to_string()
-        };
-
-        // client joins, 322 topic, 333 topic who/time, 353 users, 366 end of names
-
-        // send everyone the join message
-        for (other_id, other_user) in &self.users {
-            if !other_user.channels.contains(&id) {
-                continue;
-            }
-            output.push(u(us, *other_id, format!("JOIN {}", chan)));
-        }
-
-        // send us some details
-        output.push(u(
-            UID_SERVER,
-            us,
-            format!(
-                "332 {} {} :This topic intentionally left blank.",
-                nick, chan
-            ),
-        ));
-        // @: secret channel (+s)
-        // TODO: client modes in a channel
-
-        for names in wrapped(
-            self.users
-                .values()
-                .filter(|user| user.channels.contains(&id))
-                .map(|user| user.nick.as_ref()),
-        ) {
-            output.push(u(
+        Ok(None) => user_id,
+        Err(_err) => {
+            return vec![u(
                 UID_SERVER,
-                us,
-                format!("353 {} @ {} :{} {}", nick, chan, nick, names),
-            ));
+                user_id,
+                format!(
+                    "{:03} :invalid hostmask nickname",
+                    ErrorCode::ErroneousNickname.into_numeric()
+                ),
+            )];
+        }
+    };
+
+    let mut output = Vec::with_capacity(4);
+
+    match unpack_command(message.command()) {
+        Ok(reqs) => {
+            for req in reqs {
+                output.extend(translate_event(store, users, user_id, req));
+            }
+        }
+        Err(e) => {
+            let (then_close, cmd_and_args) = render_error(e);
+            output.push(Output {
+                from_to: FromTo::ServerToUser(user_id),
+                tags: (),
+                cmd_and_args,
+                then_close,
+            })
+        }
+    }
+
+    output
+}
+
+// TODO: Clearly this should be a Result<String, String>
+
+fn translate_event(store: &mut Store, users: &mut Users, us: UserId, event: Req) -> Vec<Output> {
+    let mut output = Vec::with_capacity(4);
+
+    match event {
+        Req::JoinChannel(ref channel) => output.extend(joined(store, users, us, channel)),
+        Req::MessageIndividual(other_nick, msg) => {
+            let to = match lookup_user(users, &other_nick) {
+                Some(user_id) => user_id,
+                None => {
+                    return vec![u(
+                        UID_SERVER,
+                        us,
+                        format!("{:03} :no such user", ErrorCode::NoSuchNick.into_numeric()),
+                    )];
+                }
+            };
+            output.push(u(us, to, format!("PRIVMSG {} :{}", other_nick, msg)))
+        }
+        Req::MessageChannel(ref channel, ref msg) => {
+            output.extend(message_channel(store, users, us, channel, msg))
+        }
+        Req::Ping(ref symbol) => output.push(u(UID_SERVER, us, render_ping(symbol))),
+        Req::Pong(ref symbol) => output.push(u(UID_SERVER, us, render_pong(symbol))),
+    }
+
+    output
+}
+
+fn lookup_user(users: &Users, nick: &Nick) -> Option<UserId> {
+    users
+        .iter()
+        .find(|(_, u)| u.nick == *nick)
+        .map(|(id, _)| *id)
+}
+
+fn message_channel(
+    store: &mut Store,
+    users: &Users,
+
+    us: UserId,
+    channel: &ChannelName,
+    msg: &str,
+) -> Vec<Output> {
+    let mut output = Vec::with_capacity(32);
+
+    let id = store.load_channel(channel);
+
+    for (other_id, other_user) in users.iter() {
+        if *other_id == us {
+            // don't message ourselves
+            continue;
         }
 
+        if !other_user.channels.contains(&id) {
+            continue;
+        }
+
+        output.push(u(us, *other_id, format!("PRIVMSG {} :{}", channel, msg)));
+    }
+
+    output
+}
+
+#[cfg(never)]
+fn on_board(token: mio::Token, account_id: AccountId, user: User) -> Vec<String> {
+    let on_boarding = send_on_boarding(&user.nick);
+
+    let new_user = UserId(self.next_user_id);
+    self.users.insert(new_user, user);
+    self.next_user_id += 1;
+
+    let client = Client::Singleton {
+        account_id,
+        user_id: new_user,
+    };
+
+    assert!(
+        self.clients.insert(token, client).is_some(),
+        "should be replacing an existing client"
+    );
+
+    on_boarding
+}
+
+fn joined(store: &mut Store, users: &mut Users, us: UserId, chan: &ChannelName) -> Vec<Output> {
+    let mut output = Vec::with_capacity(32);
+    let id = store.load_channel(chan);
+
+    let nick = {
+        let user = users
+            .get_mut(&us)
+            .expect("user generating event should exist");
+        if !user.channels.insert(id) {
+            return vec![];
+        }
+        user.nick.to_string()
+    };
+
+    // client joins, 322 topic, 333 topic who/time, 353 users, 366 end of names
+
+    // send everyone the join message
+    for (other_id, other_user) in users.iter() {
+        if !other_user.channels.contains(&id) {
+            continue;
+        }
+        output.push(u(us, *other_id, format!("JOIN {}", chan)));
+    }
+
+    // send us some details
+    output.push(u(
+        UID_SERVER,
+        us,
+        format!(
+            "332 {} {} :This topic intentionally left blank.",
+            nick, chan
+        ),
+    ));
+    // @: secret channel (+s)
+    // TODO: client modes in a channel
+
+    for names in wrapped(
+        users
+            .values()
+            .filter(|user| user.channels.contains(&id))
+            .map(|user| user.nick.as_ref()),
+    ) {
         output.push(u(
             UID_SERVER,
             us,
-            format!("366 {} {} :</names>", nick, chan),
+            format!("353 {} @ {} :{} {}", nick, chan, nick, names),
         ));
-
-        output
     }
+
+    output.push(u(
+        UID_SERVER,
+        us,
+        format!("366 {} {} :</names>", nick, chan),
+    ));
+
+    output
 }
 
 fn unpack_command(command: Result<Command, &'static str>) -> Result<Vec<Req>, ClientError> {
