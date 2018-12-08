@@ -14,7 +14,6 @@ extern crate vecio;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
-use std::fmt;
 
 use failure::Error;
 use failure::ResultExt;
@@ -38,7 +37,7 @@ type ConnId = mio::Token;
 const INPUT_LENGTH_LIMIT: usize = 4_096;
 
 #[derive(Debug, Copy, Clone)]
-struct PingToken(u64);
+pub struct PingToken(u64);
 
 impl Default for PingToken {
     fn default() -> Self {
@@ -201,15 +200,9 @@ enum FromTo {
 }
 
 #[derive(Clone, Debug)]
-enum OutArg {
-    String(String),
-    Nick,
-}
-
-#[derive(Clone, Debug)]
-struct OutCommand {
+pub struct OutCommand {
     cmd: &'static str,
-    args: Vec<OutArg>,
+    args: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -332,7 +325,7 @@ impl OutCommand {
             cmd,
             args: args
                 .into_iter()
-                .map(|s| OutArg::String(s.to_string()))
+                .map(|s| s.to_string())
                 .collect(),
         }
     }
@@ -347,15 +340,10 @@ impl OutCommand {
 
         for arg in &self.args[..self.args.len() - 1] {
             out.push(' ');
-            match arg {
-                OutArg::String(s) => {
-                    assert!(!s.is_empty());
-                    assert!(!s.starts_with(':'));
-                    assert!(!s.contains(|c: char| c.is_whitespace()));
-                    out.push_str(&s);
-                }
-                OutArg::Nick => unimplemented!(),
-            }
+            assert!(!arg.is_empty());
+            assert!(!arg.starts_with(':'));
+            assert!(!arg.contains(|c: char| c.is_whitespace()));
+            out.push_str(&arg);
         }
 
         let last_arg = &self.args[self.args.len() - 1];
@@ -363,12 +351,7 @@ impl OutCommand {
         out.push(' ');
         out.push(':');
 
-        match last_arg {
-            OutArg::String(s) => {
-                out.push_str(&s);
-            }
-            OutArg::Nick => unimplemented!(),
-        }
+        out.push_str(&last_arg);
 
         out
     }
