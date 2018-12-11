@@ -20,6 +20,8 @@ use rustls::NoClientAuth;
 use rustls::Session;
 use vecio::Rawv;
 
+use crate::rhost;
+
 /// This glues our `rustls::WriteV` trait to `vecio::Rawv`.
 pub struct WriteVAdapter<'a> {
     rawv: &'a mut Rawv,
@@ -268,6 +270,10 @@ impl Conn {
         } else {
             mio::Ready::readable()
         }
+    }
+
+    pub fn reverse(&self) -> rhost::ResolutionPending {
+        rhost::reverse(self.net.socket.peer_addr().expect("socket must have a remote address?").ip())
     }
 }
 

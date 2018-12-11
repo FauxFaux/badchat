@@ -1,7 +1,6 @@
 //! * https://modern.ircdocs.horse/#errunknownerror-400
 //! * https://www.alien.net.au/irc/irc2numerics.html
 
-use crate::ids;
 use crate::OutCommand;
 
 // Note: the horse docs use "<client>" to mean "ident", i.e. `Faux!faux@localhost`

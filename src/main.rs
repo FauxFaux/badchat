@@ -30,6 +30,7 @@ mod err;
 mod ids;
 mod pre;
 mod proto;
+mod rhost;
 mod serv;
 mod store;
 
@@ -104,6 +105,7 @@ pub struct UserId(u64);
 enum Client {
     PreAuth {
         state: PreAuth,
+        host: rhost::ResolutionPending,
     },
     Singleton {
         account_id: AccountId,
@@ -341,6 +343,7 @@ fn work_conn(
             us,
             clients.entry(us).or_insert_with(|| Client::PreAuth {
                 state: PreAuth::default(),
+                host: conn.reverse(),
             }),
             message,
         ));
@@ -361,7 +364,7 @@ fn work_client(
     info!("{:?}: work_client: {:?} - {:?}", us, client, message);
 
     match client {
-        Client::PreAuth { state } => match pre::work_pre_auth(&message, state) {
+        Client::PreAuth { state, host } => match pre::work_pre_auth(&message, state) {
             PreAuthOp::Done => {
                 let nick = state.nick.as_ref().unwrap().clone();
 
