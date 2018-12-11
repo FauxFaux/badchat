@@ -371,10 +371,13 @@ fn work_client(
                         return vec![Output {
                             from_to: FromTo::ServerToClient(us),
                             tags: (),
-                            cmd_and_args: err::password_mismatch(concat!(
-                                "Incorrect password for account. If you don't know",
-                                " the password, you must use a different nick."
-                            )),
+                            cmd_and_args: err::password_mismatch(
+                                (),
+                                concat!(
+                                    "Incorrect password for account. If you don't know",
+                                    " the password, you must use a different nick."
+                                ),
+                            ),
                             then_close: true,
                         }];
                     }
@@ -459,7 +462,11 @@ fn work_single_client(
                 return vec![Output {
                     from_to: FromTo::ServerToUser(user_id),
                     tags: (),
-                    cmd_and_args: err::erroneous_nickname(source_nick.to_string(), "no such user"),
+                    cmd_and_args: err::erroneous_nickname(
+                        (),
+                        source_nick.to_string(),
+                        "no such user",
+                    ),
                     then_close: false,
                 }];
             }
@@ -471,7 +478,11 @@ fn work_single_client(
             return vec![Output {
                 from_to: FromTo::ServerToUser(user_id),
                 tags: (),
-                cmd_and_args: err::erroneous_nickname("*".to_string(), "invalid hostmask nickname"),
+                cmd_and_args: err::erroneous_nickname(
+                    (),
+                    "*".to_string(),
+                    "invalid hostmask nickname",
+                ),
                 then_close: false,
             }];
         }
@@ -503,7 +514,7 @@ fn work_req(store: &mut Store, users: &mut Users, us: UserId, req: Req) -> Vec<O
                     return vec![Output {
                         from_to: FromTo::ServerToUser(us),
                         tags: (),
-                        cmd_and_args: err::no_such_nick(other_nick.to_string(), "no such user"),
+                        cmd_and_args: err::no_such_nick((), other_nick.to_string(), "no such user"),
                         then_close: false,
                     }];
                 }
@@ -631,7 +642,7 @@ fn unpack_command(command: Result<Command, &'static str>) -> Result<Vec<Req>, Ou
                 let chan = match ChannelName::new(&chan) {
                     Ok(chan) => chan,
                     Err(_reason) => {
-                        return Err(err::no_such_channel(chan, "channel name invalid"));
+                        return Err(err::no_such_channel((), chan, "channel name invalid"));
                     }
                 };
                 joins.push(Req::JoinChannel(chan));
@@ -642,12 +653,17 @@ fn unpack_command(command: Result<Command, &'static str>) -> Result<Vec<Req>, Ou
             if dest.starts_with('#') {
                 match ChannelName::new(dest) {
                     Ok(chan) => Ok(vec![Req::MessageChannel(chan, msg.to_string())]),
-                    Err(_reason) => Err(err::no_such_channel(dest.to_string(), "invalid channel")),
+                    Err(_reason) => Err(err::no_such_channel(
+                        (),
+                        dest.to_string(),
+                        "invalid channel",
+                    )),
                 }
             } else {
                 match Nick::new(dest) {
                     Ok(nick) => Ok(vec![Req::MessageIndividual(nick, msg.to_string())]),
                     Err(_reason) => Err(err::no_such_nick(
+                        (),
                         dest.to_string(),
                         "invalid channel or nickname",
                     )),
@@ -659,6 +675,7 @@ fn unpack_command(command: Result<Command, &'static str>) -> Result<Vec<Req>, Ou
         other => {
             info!("invalid command: {:?}", other);
             Err(err::unknown_command(
+                (),
                 "*".to_string(),
                 "unrecognised or mis-parsed command",
             ))
@@ -719,7 +736,7 @@ fn take_messages(conn: &mut serv::Conn) -> Vec<Result<Message, OutCommand>> {
     }
 
     if conn.input.buf.len() > 10 * INPUT_LENGTH_LIMIT {
-        output.push(Err(err::line_too_long("Your input buffer is full.")));
+        output.push(Err(err::line_too_long((), "Your input buffer is full.")));
 
         conn.input.broken = true;
         conn.input.buf.clear();
@@ -776,6 +793,7 @@ fn line_to_message(
         PoppedLine::NotReady => return Ok(None),
         PoppedLine::TooLong => {
             return Err(err::line_too_long(
+                (),
                 "Your message was discarded as it was too long",
             ));
         }
@@ -784,6 +802,7 @@ fn line_to_message(
     let line = String::from_utf8(line).map_err(|parse_error| {
         debug!("{:?}: {:?}", token, parse_error);
         err::bad_char_encoding(
+            (),
             "*".to_string(),
             "Your line was discarded as it was not encoded using 'utf-8'",
         )
@@ -793,7 +812,7 @@ fn line_to_message(
 
     Ok(Some(proto::parse_message(line).map_err(|parse_error| {
         debug!("{:?}: bad command: {:?}", token, parse_error);
-        err::unknown_error("Unable to parse your input as any form of message")
+        err::unknown_error((), "*", "Unable to parse your input as any form of message")
     })?))
 }
 

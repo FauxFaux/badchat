@@ -34,6 +34,7 @@ pub fn work_pre_auth(message: &Message, state: &mut PreAuth) -> PreAuthOp {
                 Ok(nick) => nick,
                 Err(_reason) => {
                     return PreAuthOp::Output(vec![err::erroneous_nickname(
+                        (),
                         "*".to_string(),
                         "invalid nickname; ascii letters, numbers, _. 2-12",
                     )]);
@@ -61,14 +62,14 @@ pub fn work_pre_auth(message: &Message, state: &mut PreAuth) -> PreAuthOp {
         }
         Ok(Command::CapUnknown) => {
             return PreAuthOp::Output(vec![err::invalid_cap_command(
-                state.nick.clone(),
+                (),
                 "*".to_string(),
                 "invalid cap command",
             )]);
         }
         Ok(Command::Ping(_)) => unreachable!("ping handled as link management"),
         _other => {
-            return PreAuthOp::Output(vec![err::not_registered("invalid pre-auth command")]);
+            return PreAuthOp::Output(vec![err::not_registered((), "invalid pre-auth command")]);
         }
     }
 
@@ -78,12 +79,14 @@ pub fn work_pre_auth(message: &Message, state: &mut PreAuth) -> PreAuthOp {
     }
 
     if state.pass.is_none() {
-        return PreAuthOp::Error(err::password_mismatch(concat!(
-            "",
-            "You must provide a password. ",
-            "For an unregistered nick, any password is fine! ",
-            "I'll just make you a new account."
-        )));
+        return PreAuthOp::Error(err::password_mismatch(
+            (),
+            concat!(
+                "You must provide a password. ",
+                "For an unregistered nick, any password is fine! ",
+                "I'll just make you a new account."
+            ),
+        ));
     }
 
     PreAuthOp::Done
