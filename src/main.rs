@@ -14,6 +14,7 @@ extern crate vecio;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
+use std::mem;
 
 use failure::Error;
 use failure::ResultExt;
@@ -365,7 +366,7 @@ fn work_client(
 
     match client {
         Client::PreAuth { state, host } => match pre::work_pre_auth(&message, state) {
-            PreAuthOp::Done => {
+            PreAuthOp::Done if host.done() => {
                 let nick = state.nick.as_ref().unwrap().clone();
 
                 let account_id = AccountId(match store.user(&nick, state.pass.as_ref().unwrap()) {
@@ -389,10 +390,19 @@ fn work_client(
                 let user_id = UserId(users.next);
                 users.next += 1;
 
-                *client = Client::Singleton {
-                    account_id,
-                    user_id,
+                let (state, host) = match mem::replace(
+                    client,
+                    Client::Singleton {
+                        account_id,
+                        user_id,
+                    },
+                ) {
+                    Client::PreAuth { state, host } => (state, host),
+                    _ => unreachable!("it was match'd above and hasn't changed"),
                 };
+
+                let (ident_name, _real_name) = state.gecos.unwrap();
+                let host = host.get();
 
                 let on_boarding = send_on_boarding(&nick.to_string());
 
@@ -400,7 +410,7 @@ fn work_client(
                     user_id,
                     User {
                         nick,
-                        host_mask: HostMask::new(),
+                        host_mask: HostMask::new(&ident_name, &host),
                         channels: HashSet::new(),
                     },
                 );
@@ -415,17 +425,23 @@ fn work_client(
                     })
                     .collect()
             }
-            PreAuthOp::Output(messages) => {
-                return messages
-                    .into_iter()
-                    .map(|cmd_and_args| Output {
-                        from_to: FromTo::ServerToClient(us),
-                        tags: (),
-                        cmd_and_args,
-                        then_close: false,
-                    })
-                    .collect();
-            }
+            // So.. this is damn terrible. Instead of waiting with timers,
+            // let's just send the client PINGs over and over again. Hah. Hah. Hah.
+            PreAuthOp::Done => vec![Output {
+                from_to: FromTo::LinkManagement(us),
+                tags: (),
+                cmd_and_args: OutCommand::new("PING", &["waiting-for-hostname"]),
+                then_close: false,
+            }],
+            PreAuthOp::Output(messages) => messages
+                .into_iter()
+                .map(|cmd_and_args| Output {
+                    from_to: FromTo::ServerToClient(us),
+                    tags: (),
+                    cmd_and_args,
+                    then_close: false,
+                })
+                .collect(),
             PreAuthOp::Ping(symbol) => vec![Output {
                 from_to: FromTo::LinkManagement(us),
                 tags: (),

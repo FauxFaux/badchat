@@ -81,9 +81,20 @@ impl ChannelName {
 }
 
 impl HostMask {
-    pub fn new() -> HostMask {
+    pub fn new(raw_user_name: &str, host: &str) -> HostMask {
+        let mut user_name: String = raw_user_name
+            .chars()
+            .filter(|c| c.is_alphanumeric())
+            .collect();
+        if user_name.is_empty() {
+            user_name.push_str("null");
+        }
+        let display_host: String = host
+            .chars()
+            .filter(|c| c.is_alphanumeric() || c.is_ascii_punctuation())
+            .collect();
         HostMask {
-            inner: String::new(),
+            inner: format!("~{}!{}", user_name, display_host),
         }
     }
 }

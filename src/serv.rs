@@ -273,7 +273,13 @@ impl Conn {
     }
 
     pub fn reverse(&self) -> rhost::ResolutionPending {
-        rhost::reverse(self.net.socket.peer_addr().expect("socket must have a remote address?").ip())
+        rhost::reverse(
+            self.net
+                .socket
+                .peer_addr()
+                .expect("socket must have a remote address?")
+                .ip(),
+        )
     }
 }
 

@@ -1,7 +1,8 @@
+use std::cell::RefCell;
 use std::net::IpAddr;
+use std::sync::mpsc;
 use std::thread;
 use std::time;
-use std::sync::mpsc;
 
 use dns_lookup;
 
@@ -14,35 +15,34 @@ enum State {
 #[derive(Debug)]
 pub struct ResolutionPending {
     ip: IpAddr,
-    state: State,
+    state: RefCell<State>,
 }
 
 pub fn reverse(ip: IpAddr) -> ResolutionPending {
     let (send, recv) = mpsc::sync_channel(1);
-    thread::spawn(move || {
-        send.send(dns_lookup::lookup_addr(&ip).ok())
-    });
+    thread::spawn(move || send.send(dns_lookup::lookup_addr(&ip).ok()));
 
-    ResolutionPending { state: State::Waiting(recv), ip }
+    ResolutionPending {
+        state: RefCell::new(State::Waiting(recv)),
+        ip,
+    }
 }
 
 impl ResolutionPending {
-    pub fn done(&mut self) -> bool {
-        match &self.state {
+    pub fn done(&self) -> bool {
+        match &*self.state.borrow() {
             State::Done(_) => true,
-            State::Waiting(recv) => {
-                match recv.try_recv() {
-                    Ok(val) => {
-                        self.state = State::Done(val);
-                        true
-                    },
-                    Err(mpsc::TryRecvError::Disconnected) => {
-                        State::Done(None);
-                        true
-                    },
-                    Err(mpsc::TryRecvError::Empty) => false,
+            State::Waiting(recv) => match recv.try_recv() {
+                Ok(val) => {
+                    self.state.replace(State::Done(val));
+                    true
                 }
-            }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.state.replace(State::Done(None));
+                    true
+                }
+                Err(mpsc::TryRecvError::Empty) => false,
+            },
         }
     }
 
@@ -51,11 +51,13 @@ impl ResolutionPending {
 
         let ip = self.ip;
 
-        let result = match self.state {
+        let result = match self.state.into_inner() {
             State::Done(val) => val,
-            _ => None,
+            State::Waiting(_) => None,
         };
 
-        result.unwrap_or_else(|| ip.to_string())
+        result
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| ip.to_string())
     }
 }
