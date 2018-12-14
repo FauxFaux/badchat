@@ -253,7 +253,7 @@ impl System {
 fn find_user(clients: &Clients, which: UserId) -> mio::Token {
     for (token, client) in clients {
         match client {
-            Client::PreAuth { .. } => unreachable!("pre-auth can't user->user"),
+            Client::PreAuth { .. } => (),
             Client::Singleton { user_id, .. } => {
                 if *user_id == which {
                     return *token;
