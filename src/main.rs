@@ -11,9 +11,11 @@ extern crate rusqlite;
 extern crate rustls;
 extern crate vecio;
 
+use std::cmp;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
+use std::hash;
 use std::mem;
 
 use failure::Error;
@@ -342,10 +344,10 @@ fn work_conn(
             store,
             users,
             us,
-            clients.entry(us).or_insert_with(|| Client::PreAuth {
-                state: PreAuth::default(),
-                host: conn.reverse(),
-            }),
+            MapBorrow {
+                inner: clients,
+                key: us,
+            },
             message,
         ));
     }
@@ -357,14 +359,19 @@ fn work_client(
     store: &mut Store,
     users: &mut Users,
     us: mio::Token,
-    client: &mut Client,
+    mut client: MapBorrow<ConnId, Client>,
     message: Message,
 ) -> Vec<Output> {
     use self::pre::PreAuthOp;
 
-    info!("{:?}: work_client: {:?} - {:?}", us, client, message);
+    info!(
+        "{:?}: work_client: {:?} - {:?}",
+        us,
+        client.get_mut(),
+        message
+    );
 
-    match client {
+    match client.get_mut() {
         Client::PreAuth { state, host } => match pre::work_pre_auth(&message, state) {
             PreAuthOp::Done if host.done() => {
                 let nick = state.nick.as_ref().unwrap().clone();
@@ -391,7 +398,7 @@ fn work_client(
                 users.next += 1;
 
                 let (state, host) = match mem::replace(
-                    client,
+                    client.get_mut(),
                     Client::Singleton {
                         account_id,
                         user_id,
@@ -869,4 +876,23 @@ fn main() -> Result<(), Error> {
         serv::serve_forever(|tokens, connections| system.work(tokens, connections))
             .with_context(|_| format_err!("running server"))?,
     )
+}
+
+struct MapBorrow<'m, K: hash::Hash + cmp::Eq, V> {
+    inner: &'m mut HashMap<K, V>,
+    key: K,
+}
+
+impl<'m, K: hash::Hash + cmp::Eq, V> AsRef<HashMap<K, V>> for MapBorrow<'m, K, V> {
+    fn as_ref(&self) -> &HashMap<K, V> {
+        &self.inner
+    }
+}
+
+impl<'m, K: hash::Hash + cmp::Eq, V> MapBorrow<'m, K, V> {
+    fn get_mut(&mut self) -> &mut V {
+        self.inner
+            .get_mut(&self.key)
+            .expect("checked at construction (lol)")
+    }
 }
