@@ -30,20 +30,18 @@ pub fn reverse(ip: IpAddr) -> ResolutionPending {
 
 impl ResolutionPending {
     pub fn done(&self) -> bool {
-        match &*self.state.borrow() {
-            State::Done(_) => true,
+        let new_val = match &*self.state.borrow() {
+            State::Done(_) => return true,
             State::Waiting(recv) => match recv.try_recv() {
-                Ok(val) => {
-                    self.state.replace(State::Done(val));
-                    true
-                }
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    self.state.replace(State::Done(None));
-                    true
-                }
-                Err(mpsc::TryRecvError::Empty) => false,
+                Ok(val) => State::Done(val),
+                Err(mpsc::TryRecvError::Disconnected) => State::Done(None),
+                Err(mpsc::TryRecvError::Empty) => return false,
             },
-        }
+        };
+
+        self.state.replace(new_val);
+
+        true
     }
 
     pub fn get(mut self) -> String {
