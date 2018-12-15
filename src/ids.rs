@@ -121,6 +121,10 @@ fn valid_channel(chan: &str) -> bool {
     valid_nick(&chan[1..])
 }
 
+pub fn valid_account(account: &str) -> bool {
+    valid_nick(account)
+}
+
 fn valid_nick(nick: &str) -> bool {
     if nick.len() <= 1 || nick.len() >= 12 {
         return false;

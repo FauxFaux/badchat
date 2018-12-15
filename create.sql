@@ -1,6 +1,7 @@
 create table account (
   id            integer primary key,
-  creation_time integer not null
+  creation_time integer not null,
+  name          varchar not null
 );
 
 create table account_pass (

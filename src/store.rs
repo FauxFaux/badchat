@@ -13,6 +13,7 @@ use rusqlite::Transaction;
 use crate::ids::ChannelName;
 use crate::ids::Nick;
 use crate::ChannelId;
+use crate::Pass;
 
 pub struct Store {
     conn: Connection,
@@ -29,18 +30,18 @@ impl Store {
         })
     }
 
-    pub fn user(&mut self, nick: &Nick, pass: &str) -> Option<i64> {
-        // committed inside `create_user`, not sure I like that?
+    pub fn account(&mut self, pass: &Pass) -> Option<i64> {
+        // committed inside `create_account`, not sure I like that?
         let tx = self.conn.transaction().unwrap_system();
 
         let account_id = match load_id(
             &tx,
-            "select account_id from nick where nick=?",
-            &[nick.as_ref()],
+            "select account_id from account where name=?",
+            &[&pass.account],
         ) {
             Some(val) => val,
             None => {
-                let user = create_user(tx, nick, pass);
+                let user = create_account(tx, pass);
                 return Some(user);
             }
         };
@@ -52,7 +53,7 @@ impl Store {
             .unwrap_system()
         {
             let hashed = hashed.unwrap_system();
-            if check_pass(pass, &hashed) {
+            if check_pass(&pass.pass, &hashed) {
                 return Some(account_id);
             }
         }
@@ -88,32 +89,29 @@ where
     }
 }
 
-fn create_user(tx: Transaction, nick: &Nick, pass: &str) -> i64 {
+fn create_account(tx: Transaction, pass: &Pass) -> i64 {
     let now = unix_time();
 
-    tx.execute("insert into account (creation_time) values (?)", &[now])
-        .unwrap_system();
-
-    let account_id = tx.last_insert_rowid();
-
     tx.execute(
-        "insert into nick (nick, account_id) values (?,?)",
-        &[&nick.as_ref() as &ToSql, &account_id],
+        "insert into account (name, creation_time) values (?,?)",
+        &[&pass.account as &ToSql, &now],
     )
     .unwrap_system();
+
+    let account_id = tx.last_insert_rowid();
 
     tx.execute(
         "insert into account_pass (account_id, pass) values (?,?)",
         &[
             &account_id as &ToSql,
-            &pbkdf2_simple(pass, PBKDF2_ITERATION_COUNT).unwrap_system(),
+            &pbkdf2_simple(&pass.pass, PBKDF2_ITERATION_COUNT).unwrap_system(),
         ],
     )
     .unwrap_system();
 
     tx.commit().unwrap_system();
 
-    info!("created user {:?}", nick);
+    info!("created account {:?}", pass.account);
 
     account_id
 }

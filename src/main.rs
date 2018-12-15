@@ -73,10 +73,17 @@ enum PreAuthPing {
     Complete,
 }
 
+// TODO: maybe not Debug, or re-implement it?
+#[derive(Debug, Clone)]
+struct Pass {
+    account: String,
+    pass: String,
+}
+
 #[derive(Debug, Default)]
 pub struct PreAuth {
     nick: Option<Nick>,
-    pass: Option<String>,
+    pass: Option<Pass>,
     gecos: Option<(String, String)>,
     sending_caps: bool,
     ping: PreAuthPing,
@@ -370,7 +377,7 @@ fn work_client(
     info!(
         "{:?}: work_client: {:?} - {:?}",
         us,
-        client.as_mut(),
+        client.as_ref(),
         message
     );
 
@@ -379,7 +386,7 @@ fn work_client(
             PreAuthOp::Done if host.done() => {
                 let nick = state.nick.as_ref().unwrap().clone();
 
-                let account_id = AccountId(match store.user(&nick, state.pass.as_ref().unwrap()) {
+                let account_id = AccountId(match store.account(state.pass.as_ref().unwrap()) {
                     Some(id) => id,
                     None => {
                         return vec![Output {
@@ -396,6 +403,30 @@ fn work_client(
                         }];
                     }
                 });
+
+                let existing_user =
+                    users.data.iter().find_map(
+                        |(id, u)| {
+                            if nick == u.nick {
+                                Some(*id)
+                            } else {
+                                None
+                            }
+                        },
+                    );
+
+                if existing_user.is_some() {
+                    return vec![Output {
+                        from_to: FromTo::ServerToClient(us),
+                        tags: (),
+                        cmd_and_args: err::nickname_in_use(
+                            (),
+                            &nick,
+                            "That nickname is in use, and the rest of this code is TODO!",
+                        ),
+                        then_close: true,
+                    }];
+                }
 
                 let user_id = UserId(users.next);
                 users.next += 1;

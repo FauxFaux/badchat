@@ -1,6 +1,7 @@
 //! * https://modern.ircdocs.horse/#errunknownerror-400
 //! * https://www.alien.net.au/irc/irc2numerics.html
 
+use crate::ids::Nick;
 use crate::OutCommand;
 
 // Note: the horse docs use "<client>" to mean "ident", i.e. `Faux!faux@localhost`
@@ -55,6 +56,12 @@ pub fn file_error<I: Ident>(ident: I, reason: &'static str) -> OutCommand {
 pub fn erroneous_nickname<I: Ident>(ident: I, _nick: String, reason: &'static str) -> OutCommand {
     // <client> <nick> :Erroneous nickname
     OutCommand::new("432", &[ident.as_ref(), "*", reason])
+}
+
+/// horse, possibly used as intended!
+pub fn nickname_in_use<I: Ident>(ident: I, nick: &Nick, reason: &'static str) -> OutCommand {
+    // <client> <nick> :Nickname is already in use
+    OutCommand::new("432", &[ident.as_ref(), nick.as_ref(), reason])
 }
 
 /// horse, including invalid pre-auth command parsing

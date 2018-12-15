@@ -1,8 +1,10 @@
 use crate::err;
+use crate::ids::valid_account;
 use crate::ids::Nick;
 use crate::proto::Command;
 use crate::proto::ParsedMessage as Message;
 use crate::OutCommand;
+use crate::Pass;
 use crate::PingToken;
 use crate::PreAuth;
 use crate::PreAuthPing;
@@ -28,7 +30,28 @@ pub fn work_pre_auth(message: &Message, state: &mut PreAuth) -> PreAuthOp {
         Ok(Command::CapEnd) => {
             state.sending_caps = false;
         }
-        Ok(Command::Pass(pass)) => state.pass = Some(pass.to_string()),
+        Ok(Command::Pass(pass)) if state.pass.is_none() => {
+            let password_parse_error = PreAuthOp::Output(vec![err::password_mismatch(
+                (),
+                concat!(
+                    "Your password must start with your account name, and a colon. ",
+                    "e.g. randall:correct_horse_battery_staple",
+                ),
+            )]);
+
+            if let Some(split) = pass.find(':') {
+                let (account, pass) = pass.split_at(split);
+                if !valid_account(account) || pass.len() < 6 {
+                    return password_parse_error;
+                }
+                state.pass = Some(Pass {
+                    account: account.to_string(),
+                    pass: pass.to_string(),
+                })
+            } else {
+                return password_parse_error;
+            }
+        }
         Ok(Command::Nick(nick)) => {
             state.nick = Some(match Nick::new(nick) {
                 Ok(nick) => nick,
