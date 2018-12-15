@@ -25,12 +25,15 @@ use rand::Rng;
 use self::ids::ChannelName;
 use self::ids::HostMask;
 use self::ids::Nick;
+use self::in_map::LazyView;
+use self::in_map::MapBorrow;
 use self::proto::Command;
 use self::proto::ParsedMessage as Message;
 use self::store::Store;
 
 mod err;
 mod ids;
+mod in_map;
 mod pre;
 mod proto;
 mod rhost;
@@ -344,10 +347,10 @@ fn work_conn(
             store,
             users,
             us,
-            MapBorrow {
-                inner: clients,
-                key: us,
-            },
+            clients.lazy_view_or_insert_with(us, || Client::PreAuth {
+                state: PreAuth::default(),
+                host: conn.reverse(),
+            }),
             message,
         ));
     }
@@ -367,11 +370,11 @@ fn work_client(
     info!(
         "{:?}: work_client: {:?} - {:?}",
         us,
-        client.get_mut(),
+        client.as_mut(),
         message
     );
 
-    match client.get_mut() {
+    match client.as_mut() {
         Client::PreAuth { state, host } => match pre::work_pre_auth(&message, state) {
             PreAuthOp::Done if host.done() => {
                 let nick = state.nick.as_ref().unwrap().clone();
@@ -398,7 +401,7 @@ fn work_client(
                 users.next += 1;
 
                 let (state, host) = match mem::replace(
-                    client.get_mut(),
+                    client.as_mut(),
                     Client::Singleton {
                         account_id,
                         user_id,
@@ -876,23 +879,4 @@ fn main() -> Result<(), Error> {
         serv::serve_forever(|tokens, connections| system.work(tokens, connections))
             .with_context(|_| format_err!("running server"))?,
     )
-}
-
-struct MapBorrow<'m, K: hash::Hash + cmp::Eq, V> {
-    inner: &'m mut HashMap<K, V>,
-    key: K,
-}
-
-impl<'m, K: hash::Hash + cmp::Eq, V> AsRef<HashMap<K, V>> for MapBorrow<'m, K, V> {
-    fn as_ref(&self) -> &HashMap<K, V> {
-        &self.inner
-    }
-}
-
-impl<'m, K: hash::Hash + cmp::Eq, V> MapBorrow<'m, K, V> {
-    fn get_mut(&mut self) -> &mut V {
-        self.inner
-            .get_mut(&self.key)
-            .expect("checked at construction (lol)")
-    }
 }
