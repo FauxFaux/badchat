@@ -11,7 +11,6 @@ use rusqlite::Connection;
 use rusqlite::Transaction;
 
 use crate::ids::ChannelName;
-use crate::ids::Nick;
 use crate::ChannelId;
 use crate::Pass;
 

@@ -17,6 +17,7 @@ use mio::tcp::TcpListener;
 use mio::tcp::TcpStream;
 use mio::Token;
 use rustls::NoClientAuth;
+use rustls::ServerConfig;
 use rustls::Session;
 use vecio::Rawv;
 
@@ -375,7 +376,7 @@ fn load_private_key(filename: &str) -> Result<rustls::PrivateKey, Error> {
     }
 }
 
-fn make_config() -> Result<rustls::ServerConfig, Error> {
+pub fn make_config() -> Result<rustls::ServerConfig, Error> {
     let mut config = rustls::ServerConfig::new(NoClientAuth::new());
     config.key_log = Arc::new(rustls::KeyLogFile::new());
 
@@ -388,55 +389,60 @@ fn make_config() -> Result<rustls::ServerConfig, Error> {
     Ok(config)
 }
 
-pub fn serve_forever<F: FnMut(&HashSet<Token>, &mut Connections)>(
-    mut work: F,
-) -> Result<(), Error> {
-    let mut poll = mio::Poll::new()?;
-    let mut last_id: usize = 1;
+pub struct Context {
+    poll: mio::Poll,
+    next_id: usize,
+    servers: HashMap<mio::Token, Server>,
+    connections: Connections,
+    events: mio::Events,
+}
 
-    let mut servers = HashMap::with_capacity(4);
-
-    let tls_config = Arc::new(make_config()?);
-
-    for (addr, ssl) in &[("[::]:6667", false), ("[::]:6697", true)] {
-        let token = mio::Token(last_id);
-        last_id += 1;
-
-        let addr = addr.parse()?;
-        let server = bind(&mut poll, addr, token)?;
-
-        let server = if *ssl {
-            Server::Tls(TlsServer::new(server, tls_config.clone()))
-        } else {
-            Server::Plain(PlainServer { server })
-        };
-
-        trace!(
-            "{:?} is a {} server on {:?}",
-            token,
-            if *ssl { "ssl" } else { "plain" },
-            addr
-        );
-
-        servers.insert(token, server);
+impl Context {
+    pub fn new() -> Result<Context, Error> {
+        Ok(Context {
+            poll: mio::Poll::new()?,
+            next_id: 1,
+            servers: HashMap::with_capacity(4),
+            connections: HashMap::with_capacity(128),
+            events: mio::Events::with_capacity(256),
+        })
     }
 
-    let mut connections = HashMap::with_capacity(32);
+    pub fn bind_plain(&mut self, addr: net::SocketAddr) -> Result<(), Error> {
+        let (token, server) = self.bind(addr)?;
+        self.servers
+            .insert(token, Server::Plain(PlainServer { server }));
+        Ok(())
+    }
 
-    let mut events = mio::Events::with_capacity(256);
-    loop {
-        poll.poll(&mut events, None)?;
+    pub fn bind_tls(
+        &mut self,
+        addr: net::SocketAddr,
+        tls_config: Arc<ServerConfig>,
+    ) -> Result<(), Error> {
+        let (token, server) = self.bind(addr)?;
+        self.servers
+            .insert(token, Server::Tls(TlsServer { server, tls_config }));
+        Ok(())
+    }
+
+    pub fn drive<F: FnMut(&HashSet<Token>, &mut Connections)>(
+        &mut self,
+        mut work: F,
+    ) -> Result<(), Error> {
+        self.poll.poll(&mut self.events, None)?;
 
         let mut useful_tokens = HashSet::with_capacity(4);
 
         // handle accepting and reading/writing data from/to active connections
-        for event in events.iter() {
+        for event in self.events.iter() {
             let token = event.token();
-            if let Some(server) = servers.get_mut(&token) {
-                last_id += 1;
-                let token = mio::Token(last_id);
-                connections.insert(token, server.accept(&mut poll, token)?);
-            } else if let Some(conn) = connections.get_mut(&token) {
+            if let Some(server) = self.servers.get_mut(&token) {
+                let token = mio::Token(self.next_id);
+                self.next_id += 1;
+                self.connections
+                    .insert(token, server.accept(&mut self.poll, token)?);
+            } else if let Some(conn) = self.connections.get_mut(&token) {
                 if conn.handle_readiness(event.readiness())? {
                     useful_tokens.insert(token);
                 }
@@ -446,32 +452,40 @@ pub fn serve_forever<F: FnMut(&HashSet<Token>, &mut Connections)>(
         }
 
         // do useful application work on clients
-        work(&useful_tokens, &mut connections);
+        work(&useful_tokens, &mut self.connections);
 
         // check if any of the work we did means there's more networking work to do
-        for conn in connections.values_mut() {
-            conn.handle_registration(&mut poll)?;
+        for conn in self.connections.values_mut() {
+            conn.handle_registration(&mut self.poll)?;
         }
 
         // check if anyone actually managed to die
-        connections.retain(|_token, conn| !conn.net.closed);
+        self.connections.retain(|_token, conn| !conn.net.closed);
+
+        Ok(())
     }
-}
 
-fn bind(
-    poll: &mut mio::Poll,
-    addr: net::SocketAddr,
-    token: mio::Token,
-) -> Result<TcpListener, Error> {
-    let listener =
-        TcpListener::bind(&addr).with_context(|_| format_err!("cannot listen on tls port"))?;
+    fn bind(&mut self, addr: net::SocketAddr) -> Result<(mio::Token, TcpListener), Error> {
+        let token = mio::Token(self.next_id);
+        self.next_id += 1;
 
-    poll.register(
-        &listener,
-        token,
-        mio::Ready::readable(),
-        mio::PollOpt::level(),
-    )?;
+        let listener = TcpListener::bind(&addr)
+            .with_context(|_| format_err!("cannot listen on {:?}", addr))?;
 
-    Ok(listener)
+        self.poll.register(
+            &listener,
+            token,
+            mio::Ready::readable(),
+            mio::PollOpt::level(),
+        )?;
+
+        info!(
+            "{:?} is bound to {:?} ({:?})",
+            token,
+            addr,
+            listener.local_addr()?,
+        );
+
+        Ok((token, listener))
+    }
 }

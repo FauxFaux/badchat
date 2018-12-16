@@ -2,7 +2,6 @@ use std::cell::RefCell;
 use std::net::IpAddr;
 use std::sync::mpsc;
 use std::thread;
-use std::time;
 
 use dns_lookup;
 
@@ -44,7 +43,7 @@ impl ResolutionPending {
         true
     }
 
-    pub fn get(mut self) -> String {
+    pub fn get(self) -> String {
         self.done();
 
         let ip = self.ip;

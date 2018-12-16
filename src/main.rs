@@ -11,15 +11,13 @@ extern crate rusqlite;
 extern crate rustls;
 extern crate vecio;
 
-use std::cmp;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
-use std::hash;
 use std::mem;
+use std::sync::Arc;
 
 use failure::Error;
-use failure::ResultExt;
 use rand::Rng;
 
 use self::ids::ChannelName;
@@ -75,7 +73,7 @@ enum PreAuthPing {
 
 // TODO: maybe not Debug, or re-implement it?
 #[derive(Debug, Clone)]
-struct Pass {
+pub struct Pass {
     account: String,
     pass: String,
 }
@@ -507,7 +505,7 @@ fn work_client(
 fn work_single_client(
     store: &mut Store,
     users: &mut Users,
-    account_id: AccountId,
+    _account_id: AccountId,
     user_id: UserId,
     message: Message,
 ) -> Vec<Output> {
@@ -906,8 +904,12 @@ fn main() -> Result<(), Error> {
 
     let mut system = System::new()?;
 
-    Ok(
-        serv::serve_forever(|tokens, connections| system.work(tokens, connections))
-            .with_context(|_| format_err!("running server"))?,
-    )
+    let mut context = serv::Context::new()?;
+
+    context.bind_plain("[::]:6667".parse()?)?;
+    context.bind_tls("[::]:6697".parse()?, Arc::new(serv::make_config()?))?;
+
+    loop {
+        context.drive(|tokens, connections| system.work(tokens, connections))?;
+    }
 }
