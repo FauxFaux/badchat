@@ -1,9 +1,6 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
-use std::fs;
-use std::io;
-use std::io::BufReader;
 use std::io::Read;
 use std::io::Write;
 use std::net;
@@ -16,44 +13,22 @@ use mio::tcp::Shutdown;
 use mio::tcp::TcpListener;
 use mio::tcp::TcpStream;
 use mio::Token;
-use rustls::NoClientAuth;
 use rustls::ServerConfig;
 use rustls::Session;
-use vecio::Rawv;
+
+mod plain;
+mod tls;
+mod tls_config;
 
 use crate::rhost;
 
-/// This glues our `rustls::WriteV` trait to `vecio::Rawv`.
-pub struct WriteVAdapter<'a> {
-    rawv: &'a mut Rawv,
-}
-
-impl<'a> WriteVAdapter<'a> {
-    pub fn new(rawv: &'a mut Rawv) -> WriteVAdapter<'a> {
-        WriteVAdapter { rawv }
-    }
-}
-
-impl<'a> rustls::WriteV for WriteVAdapter<'a> {
-    fn writev(&mut self, bytes: &[&[u8]]) -> io::Result<usize> {
-        self.rawv.writev(bytes)
-    }
-}
+pub use self::tls_config::make_default_tls_config;
 
 pub type Connections = HashMap<mio::Token, Conn>;
 
 enum Server {
-    Plain(PlainServer),
-    Tls(TlsServer),
-}
-
-struct PlainServer {
-    server: TcpListener,
-}
-
-struct TlsServer {
-    server: TcpListener,
-    tls_config: Arc<rustls::ServerConfig>,
+    Plain(plain::PlainServer),
+    Tls(tls::TlsServer),
 }
 
 impl Server {
@@ -62,71 +37,6 @@ impl Server {
             Server::Plain(server) => server.accept(poll, new_token),
             Server::Tls(server) => server.accept(poll, new_token),
         }
-    }
-}
-
-impl PlainServer {
-    fn accept(&mut self, poll: &mut mio::Poll, new_token: mio::Token) -> Result<Conn, Error> {
-        let (socket, addr) = self.server.accept()?;
-        debug!("Accepting new plain connection from {:?}", addr);
-
-        let conn = Conn {
-            net: NetConn {
-                socket,
-                token: new_token,
-                closing: false,
-                closed: false,
-            },
-            input: InputBuffer::default(),
-            extra: ConnType::Plain(VecDeque::new()),
-        };
-
-        poll.register(
-            &conn.net.socket,
-            new_token,
-            mio::Ready::readable() | mio::Ready::writable(),
-            mio::PollOpt::level() | mio::PollOpt::oneshot(),
-        )?;
-
-        Ok(conn)
-    }
-}
-
-impl TlsServer {
-    fn new(server: TcpListener, cfg: Arc<rustls::ServerConfig>) -> TlsServer {
-        TlsServer {
-            server,
-            tls_config: cfg,
-        }
-    }
-
-    fn accept(&mut self, poll: &mut mio::Poll, new_token: mio::Token) -> Result<Conn, Error> {
-        let (socket, addr) = self.server.accept()?;
-        debug!("Accepting new tls connection from {:?}", addr);
-
-        let tls_session = rustls::ServerSession::new(&self.tls_config);
-
-        let net = NetConn {
-            socket,
-            token: new_token,
-            closing: false,
-            closed: false,
-        };
-
-        poll.register(
-            &net.socket,
-            net.token,
-            mio::Ready::readable() | mio::Ready::writable(),
-            mio::PollOpt::level() | mio::PollOpt::oneshot(),
-        )?;
-
-        let conn = Conn {
-            net,
-            input: InputBuffer::default(),
-            extra: ConnType::Tls(tls_session),
-        };
-
-        Ok(conn)
     }
 }
 
@@ -200,12 +110,12 @@ impl Conn {
                 // If we're readable: read some TLS. Then see if that yielded new plaintext.
 
                 if readiness.is_readable() {
-                    do_tls_read(&mut self.net, tls);
-                    new_input |= try_plain_read(&mut self.net, &mut self.input, tls)?;
+                    tls::do_tls_read(&mut self.net, tls);
+                    new_input |= tls::try_plain_read(&mut self.net, &mut self.input, tls)?;
                 }
 
                 if readiness.is_writable() {
-                    do_tls_write(&mut self.net, tls);
+                    tls::do_tls_write(&mut self.net, tls);
                 }
             }
         }
@@ -284,111 +194,6 @@ impl Conn {
     }
 }
 
-fn do_tls_read(net: &mut NetConn, tls_session: &mut rustls::ServerSession) {
-    // Read some TLS data.
-    match tls_session.read_tls(&mut net.socket) {
-        Ok(0) => {
-            debug!("eof");
-            net.closing = true;
-        }
-
-        Err(ref e) if io::ErrorKind::WouldBlock == e.kind() => (),
-
-        Err(e) => {
-            error!("read error {:?}", e);
-            net.closing = true;
-        }
-
-        Ok(_) => {
-            if let Err(e) = tls_session.process_new_packets() {
-                error!("cannot process packet: {:?}", e);
-                net.closing = true;
-            }
-        }
-    }
-}
-
-/// @return true if some new data is available
-fn try_plain_read(
-    net: &mut NetConn,
-    input: &mut InputBuffer,
-    tls_session: &mut rustls::ServerSession,
-) -> Result<bool, Error> {
-    // Read and process all available plaintext.
-    let mut buf = Vec::new();
-
-    Ok(match tls_session.read_to_end(&mut buf) {
-        Ok(0) => false,
-        Ok(_) => {
-            debug!("plaintext read {:?}", buf.len());
-            input.buf.extend(buf);
-            true
-        }
-        Err(e) => {
-            error!("plaintext read failed: {:?}", e);
-            net.closing = true;
-            false
-        }
-    })
-}
-
-fn do_tls_write(net: &mut NetConn, tls_session: &mut rustls::ServerSession) {
-    let rc = tls_session.writev_tls(&mut WriteVAdapter::new(&mut net.socket));
-    if rc.is_err() {
-        error!("write failed {:?}", rc);
-        net.closing = true;
-        return;
-    }
-}
-
-fn load_certs(filename: &str) -> Result<Vec<rustls::Certificate>, Error> {
-    let certfile =
-        fs::File::open(filename).with_context(|_| format_err!("cannot open certificate file"))?;
-    let mut reader = BufReader::new(certfile);
-    Ok(rustls::internal::pemfile::certs(&mut reader)
-        .map_err(|()| format_err!("pemfile certs reader"))?)
-}
-
-fn load_private_key(filename: &str) -> Result<rustls::PrivateKey, Error> {
-    let rsa_keys = {
-        let keyfile = fs::File::open(filename)
-            .with_context(|_| format_err!("cannot open private key file"))?;
-        let mut reader = BufReader::new(keyfile);
-        rustls::internal::pemfile::rsa_private_keys(&mut reader)
-            .map_err(|()| format_err!("file contains invalid rsa private key"))?
-    };
-
-    let pkcs8_keys = {
-        let keyfile = fs::File::open(filename)
-            .with_context(|_| format_err!("cannot open private key file"))?;
-        let mut reader = BufReader::new(keyfile);
-        rustls::internal::pemfile::pkcs8_private_keys(&mut reader).map_err(|_| {
-            format_err!("file contains invalid pkcs8 private key (encrypted keys not supported)")
-        })?
-    };
-
-    // prefer to load pkcs8 keys
-    if !pkcs8_keys.is_empty() {
-        Ok(pkcs8_keys[0].clone())
-    } else {
-        assert!(!rsa_keys.is_empty());
-        Ok(rsa_keys[0].clone())
-    }
-}
-
-pub fn make_config() -> Result<rustls::ServerConfig, Error> {
-    let mut config = rustls::ServerConfig::new(NoClientAuth::new());
-    config.key_log = Arc::new(rustls::KeyLogFile::new());
-
-    let certs = load_certs("localhost.crt")?;
-    let privkey = load_private_key("localhost.key")?;
-    config
-        .set_single_cert_with_ocsp_and_sct(certs, privkey, vec![], vec![])
-        .with_context(|_| format_err!("bad certificates/private key"))?;
-
-    Ok(config)
-}
-
 pub struct Context {
     poll: mio::Poll,
     next_id: usize,
@@ -411,7 +216,7 @@ impl Context {
     pub fn bind_plain(&mut self, addr: net::SocketAddr) -> Result<(), Error> {
         let (token, server) = self.bind(addr)?;
         self.servers
-            .insert(token, Server::Plain(PlainServer { server }));
+            .insert(token, Server::Plain(plain::PlainServer::new(server)));
         Ok(())
     }
 
@@ -422,7 +227,7 @@ impl Context {
     ) -> Result<(), Error> {
         let (token, server) = self.bind(addr)?;
         self.servers
-            .insert(token, Server::Tls(TlsServer { server, tls_config }));
+            .insert(token, Server::Tls(tls::TlsServer::new(server, tls_config)));
         Ok(())
     }
 

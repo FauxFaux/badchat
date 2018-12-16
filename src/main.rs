@@ -905,9 +905,10 @@ fn main() -> Result<(), Error> {
     let mut system = System::new()?;
 
     let mut context = serv::Context::new()?;
+    let tls_config = Arc::new(serv::make_default_tls_config()?);
 
     context.bind_plain("[::]:6667".parse()?)?;
-    context.bind_tls("[::]:6697".parse()?, Arc::new(serv::make_config()?))?;
+    context.bind_tls("[::]:6697".parse()?, tls_config)?;
 
     loop {
         context.drive(|tokens, connections| system.work(tokens, connections))?;
