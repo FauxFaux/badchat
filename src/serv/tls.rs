@@ -5,7 +5,6 @@ use std::sync::Arc;
 use anyhow::Error;
 use mio::tcp::TcpListener;
 use rustls::Session;
-use vecio::Rawv;
 
 use crate::serv::Conn;
 use crate::serv::ConnType;
@@ -101,27 +100,10 @@ pub fn try_plain_read(
 }
 
 pub fn do_tls_write(net: &mut NetConn, tls_session: &mut rustls::ServerSession) {
-    let rc = tls_session.writev_tls(&mut WriteVAdapter::new(&mut net.socket));
+    let rc = tls_session.write_tls(&mut net.socket);
     if rc.is_err() {
         error!("write failed {:?}", rc);
         net.closing = true;
         return;
-    }
-}
-
-/// This glues our `rustls::WriteV` trait to `vecio::Rawv`.
-pub struct WriteVAdapter<'a> {
-    rawv: &'a mut dyn Rawv,
-}
-
-impl<'a> WriteVAdapter<'a> {
-    pub fn new(rawv: &'a mut dyn Rawv) -> WriteVAdapter<'a> {
-        WriteVAdapter { rawv }
-    }
-}
-
-impl<'a> rustls::WriteV for WriteVAdapter<'a> {
-    fn writev(&mut self, bytes: &[&[u8]]) -> io::Result<usize> {
-        self.rawv.writev(bytes)
     }
 }

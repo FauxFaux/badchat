@@ -12,8 +12,7 @@ log = "0.4.6"
 maplit = "1"
 mio = "0.6"
 rand = "0.8"
-rustls = "0.17"
-vecio = "0.1"
+rustls = "0.19"
 
 [dependencies.pbkdf2]
 version = "0.8"
