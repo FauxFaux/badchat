@@ -1,15 +1,7 @@
-extern crate cast;
-extern crate env_logger;
 #[macro_use]
-extern crate failure;
+extern crate anyhow;
 #[macro_use]
 extern crate log;
-extern crate mio;
-extern crate pbkdf2;
-extern crate rand;
-extern crate rusqlite;
-extern crate rustls;
-extern crate vecio;
 
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -17,7 +9,7 @@ use std::collections::VecDeque;
 use std::mem;
 use std::sync::Arc;
 
-use failure::Error;
+use anyhow::Error;
 use rand::Rng;
 
 use self::ids::ChannelName;

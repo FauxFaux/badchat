@@ -1,7 +1,4 @@
-extern crate failure;
-extern crate rusqlite;
-
-use failure::Error;
+use anyhow::Error;
 use rusqlite::Connection;
 
 /// quick panic about: If the first byte of the payload is 0x00, 0x01, or 0x02

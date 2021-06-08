@@ -1,8 +1,8 @@
 use std::fmt;
 use std::time;
 
+use anyhow::Error;
 use cast::i64;
-use failure::Error;
 use pbkdf2::pbkdf2_check;
 use pbkdf2::pbkdf2_simple;
 use pbkdf2::CheckError;

@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 
-use failure::Error;
+use anyhow::Error;
 use mio::tcp::TcpListener;
 
 use super::Conn;

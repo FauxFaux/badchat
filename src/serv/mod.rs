@@ -6,9 +6,9 @@ use std::io::Write;
 use std::net;
 use std::sync::Arc;
 
-use failure::err_msg;
-use failure::Error;
-use failure::ResultExt;
+use anyhow::anyhow;
+use anyhow::Context as _;
+use anyhow::Error;
 use mio::tcp::Shutdown;
 use mio::tcp::TcpListener;
 use mio::tcp::TcpStream;
@@ -82,7 +82,7 @@ impl Conn {
                         .net
                         .socket
                         .read(&mut buf)
-                        .with_context(|_| err_msg("reading"))?;
+                        .with_context(|| anyhow!("reading"))?;
                     if 0 == read {
                         // EOF!
                         self.net.closing = true;
@@ -98,11 +98,11 @@ impl Conn {
                     self.net
                         .socket
                         .write_all(first)
-                        .with_context(|_| err_msg("writing first"))?;
+                        .with_context(|| anyhow!("writing first"))?;
                     self.net
                         .socket
                         .write_all(then)
-                        .with_context(|_| err_msg("writing then"))?;
+                        .with_context(|| anyhow!("writing then"))?;
                     output.clear();
                 }
             }
@@ -274,8 +274,8 @@ impl Context {
         let token = mio::Token(self.next_id);
         self.next_id += 1;
 
-        let listener = TcpListener::bind(&addr)
-            .with_context(|_| format_err!("cannot listen on {:?}", addr))?;
+        let listener =
+            TcpListener::bind(&addr).with_context(|| format_err!("cannot listen on {:?}", addr))?;
 
         self.poll.register(
             &listener,

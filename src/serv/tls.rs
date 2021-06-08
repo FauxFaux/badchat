@@ -2,7 +2,7 @@ use std::io;
 use std::io::Read;
 use std::sync::Arc;
 
-use failure::Error;
+use anyhow::Error;
 use mio::tcp::TcpListener;
 use rustls::Session;
 use vecio::Rawv;
