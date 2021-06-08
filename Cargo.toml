@@ -11,10 +11,13 @@ env_logger = "0.8"
 log = "0.4.6"
 maplit = "1"
 mio = "0.6"
-pbkdf2 = "0.6"
 rand = "0.8"
 rustls = "0.17"
 vecio = "0.1"
+
+[dependencies.pbkdf2]
+version = "0.8"
+features = ["simple"]
 
 [dependencies.rusqlite]
 version = "0.25"

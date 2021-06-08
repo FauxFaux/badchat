@@ -3,24 +3,19 @@ use std::fmt;
 use std::time;
 
 use anyhow::Error;
-use pbkdf2::CheckError;
-use pbkdf2::pbkdf2_check;
-use pbkdf2::pbkdf2_simple;
-use rusqlite::{Connection, Params};
-use rusqlite::Transaction;
 use rusqlite::types::ToSql;
+use rusqlite::Transaction;
+use rusqlite::{Connection, Params};
 
-use crate::ChannelId;
 use crate::ids::ChannelName;
+use crate::pbkdf2::pbkdf2_check;
+use crate::pbkdf2::pbkdf2_simple;
+use crate::ChannelId;
 use crate::Pass;
 
 pub struct Store {
     conn: Connection,
 }
-
-/// ..for new passwords. Low by modern standards, but
-/// also we're exposed like crazy.
-const PBKDF2_ITERATION_COUNT: u32 = 4096;
 
 impl Store {
     pub fn new() -> Result<Store, Error> {
@@ -103,7 +98,7 @@ fn create_account(tx: Transaction, pass: &Pass) -> i64 {
         "insert into account_pass (account_id, pass) values (?,?)",
         &[
             &account_id as &ToSql,
-            &pbkdf2_simple(&pass.pass, PBKDF2_ITERATION_COUNT).unwrap_system(),
+            &pbkdf2_simple(&pass.pass).unwrap_system(),
         ],
     )
     .unwrap_system();
@@ -135,8 +130,7 @@ fn create_channel(tx: Transaction, name: &ChannelName) -> i64 {
 
 fn check_pass(pass: &str, hashed: &str) -> bool {
     match pbkdf2_check(pass, hashed) {
-        Ok(()) => true,
-        Err(CheckError::HashMismatch) => false,
+        Ok(v) => v,
         Err(e) => {
             error!("pass parsing failed: {:?}: {:?}", hashed, e);
             false
