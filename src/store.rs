@@ -7,8 +7,8 @@ use pbkdf2::pbkdf2_check;
 use pbkdf2::pbkdf2_simple;
 use pbkdf2::CheckError;
 use rusqlite::types::ToSql;
-use rusqlite::Connection;
 use rusqlite::Transaction;
+use rusqlite::{Connection, Params};
 
 use crate::ids::ChannelName;
 use crate::ChannelId;
@@ -48,7 +48,7 @@ impl Store {
         for hashed in tx
             .prepare_cached("select pass from account_pass where account_id=?")
             .unwrap_system()
-            .query_map(&[account_id], |row| row.get::<_, String>(0))
+            .query_map([account_id], |row| row.get::<_, String>(0))
             .unwrap_system()
         {
             let hashed = hashed.unwrap_system();
@@ -73,7 +73,7 @@ impl Store {
 
 fn load_id<P>(tx: &Transaction, query: &'static str, params: P) -> Option<i64>
 where
-    P: IntoIterator,
+    P: IntoIterator + Params,
     P::Item: ToSql,
 {
     let mut stat = tx.prepare_cached(query).unwrap_system();

@@ -900,7 +900,7 @@ fn pop_line(buf: &mut VecDeque<u8>) -> PoppedLine {
 }
 
 fn main() -> Result<(), Error> {
-    env_logger::Builder::new().parse("trace").init();
+    env_logger::Builder::new().parse_filters("trace").init();
 
     let mut system = System::new()?;
 
