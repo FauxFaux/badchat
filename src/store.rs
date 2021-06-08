@@ -88,7 +88,7 @@ fn create_account(tx: Transaction, pass: &Pass) -> i64 {
 
     tx.execute(
         "insert into account (name, creation_time) values (?,?)",
-        &[&pass.account as &ToSql, &now],
+        &[&pass.account as &dyn ToSql, &now],
     )
     .unwrap_system();
 
@@ -97,7 +97,7 @@ fn create_account(tx: Transaction, pass: &Pass) -> i64 {
     tx.execute(
         "insert into account_pass (account_id, pass) values (?,?)",
         &[
-            &account_id as &ToSql,
+            &account_id as &dyn ToSql,
             &pbkdf2_simple(&pass.pass).unwrap_system(),
         ],
     )
@@ -115,7 +115,7 @@ fn create_channel(tx: Transaction, name: &ChannelName) -> i64 {
 
     tx.execute(
         "insert into channel (name, creation_time, mode) values (?,?,?)",
-        &[&name.as_ref() as &ToSql, &now, &""],
+        &[&name.as_ref() as &dyn ToSql, &now, &""],
     )
     .unwrap_system();
 

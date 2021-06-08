@@ -8,15 +8,12 @@ use rusqlite::Connection;
 #[test]
 fn round_trip() -> Result<(), Error> {
     let conn = Connection::open_in_memory()?;
-    conn.execute(
-        "create table strings (val text not null)",
-        rusqlite::NO_PARAMS,
-    )?;
+    conn.execute("create table strings (val text not null)", [])?;
     let mut trunc = conn.prepare("delete from strings")?;
     let mut write = conn.prepare("insert into strings (val) values (?)")?;
     let mut read = conn.prepare("select val from strings")?;
     for c in 1..255 {
-        trunc.execute(rusqlite::NO_PARAMS)?;
+        trunc.execute([])?;
 
         let mut before = String::with_capacity(16);
         let c_as_char = std::char::from_u32(c).expect("from_u32");
@@ -25,7 +22,7 @@ fn round_trip() -> Result<(), Error> {
         before.push(c_as_char);
 
         write.execute(&[&before])?;
-        let after: String = read.query_row(rusqlite::NO_PARAMS, |row| row.get(0))?;
+        let after: String = read.query_row([], |row| row.get(0))?;
         assert_eq!(before, after);
     }
     Ok(())
