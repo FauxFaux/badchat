@@ -6,8 +6,7 @@ edition = "2018"
 
 [dependencies]
 anyhow = "1"
-cast = "0.2.2"
-dns-lookup = "1.0.0"
+dns-lookup = "1"
 env_logger = "0.8"
 log = "0.4.6"
 maplit = "1"
@@ -15,7 +14,7 @@ mio = "0.6"
 pbkdf2 = "0.6"
 rand = "0.8"
 rustls = "0.17"
-vecio = "0.1.0"
+vecio = "0.1"
 
 [dependencies.rusqlite]
 version = "0.25"

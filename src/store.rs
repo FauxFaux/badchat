@@ -1,17 +1,17 @@
+use std::convert::TryFrom;
 use std::fmt;
 use std::time;
 
 use anyhow::Error;
-use cast::i64;
+use pbkdf2::CheckError;
 use pbkdf2::pbkdf2_check;
 use pbkdf2::pbkdf2_simple;
-use pbkdf2::CheckError;
-use rusqlite::types::ToSql;
-use rusqlite::Transaction;
 use rusqlite::{Connection, Params};
+use rusqlite::Transaction;
+use rusqlite::types::ToSql;
 
-use crate::ids::ChannelName;
 use crate::ChannelId;
+use crate::ids::ChannelName;
 use crate::Pass;
 
 pub struct Store {
@@ -145,10 +145,12 @@ fn check_pass(pass: &str, hashed: &str) -> bool {
 }
 
 fn unix_time() -> i64 {
-    i64(time::SystemTime::now()
-        .duration_since(time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs())
+    i64::try_from(
+        time::SystemTime::now()
+            .duration_since(time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    )
     .expect("current time out of range")
 }
 
