@@ -5,19 +5,25 @@ authors = ["Chris West (Faux) <git@goeswhere.com>"]
 edition = "2018"
 
 [dependencies]
-argh = "0.1"
 anyhow = "1"
+bincode = "2.0.0-rc.3"
+bunyarrs = "0.2"
+config = "0.14"
 dns-lookup = "1"
 env_logger = "0.8"
 log = "0.4.6"
 maplit = "1"
-tokio = { version = "1", features = ["full"] }
-tokio-rustls = "0.25"
-rustls-pki-types = "1"
 mio = "0.6"
 rand = "0.8"
 rustls = "0.22"
 rustls-pemfile = "2.1.0"
+rustls-pki-types = "1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-rustls = "0.25"
+tokio-util = "0.7"
+uuid = { version = "1.7", features = ["v7"] }
 
 [dependencies.pbkdf2]
 version = "0.8"
