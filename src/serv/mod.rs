@@ -14,7 +14,6 @@ use mio::tcp::TcpListener;
 use mio::tcp::TcpStream;
 use mio::Token;
 use rustls::ServerConfig;
-use rustls::Session;
 
 mod plain;
 mod tls;
@@ -42,7 +41,6 @@ impl Server {
 
 pub enum ConnType {
     Plain(VecDeque<u8>),
-    Tls(rustls::ServerSession),
 }
 
 pub struct NetConn {
@@ -106,18 +104,6 @@ impl Conn {
                     output.clear();
                 }
             }
-            ConnType::Tls(tls) => {
-                // If we're readable: read some TLS. Then see if that yielded new plaintext.
-
-                if readiness.is_readable() {
-                    tls::do_tls_read(&mut self.net, tls);
-                    new_input |= tls::try_plain_read(&mut self.net, &mut self.input, tls)?;
-                }
-
-                if readiness.is_writable() {
-                    tls::do_tls_write(&mut self.net, tls);
-                }
-            }
         }
         Ok(new_input)
     }
@@ -126,7 +112,6 @@ impl Conn {
         if self.net.closing
             && match &mut self.extra {
                 ConnType::Plain(output) => output.is_empty(),
-                ConnType::Tls(tls) => !tls.wants_write(),
             }
         {
             let _ = self.net.socket.shutdown(Shutdown::Both);
@@ -151,19 +136,12 @@ impl Conn {
                 output.extend(val.as_bytes());
                 output.extend(b"\r\n");
             }
-            ConnType::Tls(tls) => {
-                tls.write_all(val.as_bytes())?;
-                tls.write_all(b"\r\n")?;
-            }
         }
         Ok(())
     }
 
     pub fn start_closing(&mut self) {
         if !self.net.closing {
-            if let ConnType::Tls(tls) = &mut self.extra {
-                tls.send_close_notify();
-            }
             self.net.closing = true;
         }
     }
@@ -171,7 +149,6 @@ impl Conn {
     pub fn event_set(&self) -> mio::Ready {
         let (rd, wr) = match &self.extra {
             ConnType::Plain(output) => (true, !output.is_empty()),
-            ConnType::Tls(tls) => (tls.wants_read(), tls.wants_write()),
         };
 
         if rd && wr {
