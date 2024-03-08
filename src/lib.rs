@@ -24,6 +24,7 @@ use self::store::Store;
 mod err;
 mod ids;
 mod in_map;
+mod lined_shared;
 mod pbkdf2;
 mod pre;
 mod proto;
