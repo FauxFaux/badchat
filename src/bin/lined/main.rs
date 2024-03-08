@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
-use bunyarrs::{vars, vars_dbg};
+use bunyarrs::{vars, vars_dbg, Bunyarr};
 use rustls_pemfile::{certs, rsa_private_keys};
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::io::{
@@ -52,6 +52,7 @@ enum MessageOut {
 struct State {
     inbound: tokio::sync::mpsc::Sender<(Uuid, MessageIn)>,
     clients: Mutex<HashMap<Uuid, Client>>,
+    logger: Bunyarr,
 }
 
 struct Client {
@@ -81,10 +82,11 @@ async fn main() -> Result<()> {
     let state = Arc::new(State {
         clients: Mutex::new(HashMap::new()),
         inbound: inbound_tx,
+        logger,
     });
 
     loop {
-        // let mut plain_servers = Vec::new();
+        let mut plain_servers = Vec::new();
         let mut tls_servers = Vec::new();
         // let mut admin_servers = Vec::new();
         for &(addr, port, tls) in &ext_binds {
@@ -101,20 +103,35 @@ async fn main() -> Result<()> {
                     )),
                 ));
             } else {
-                // plain_servers.push((cancel, tokio::spawn(plain_server(addr, port, cancel_clone))));
+                plain_servers.push((
+                    cancel,
+                    tokio::spawn(plain_server(
+                        (addr, port).into(),
+                        cancel_clone,
+                        Arc::clone(&state),
+                    )),
+                ));
             }
         }
         for &(addr, port) in &int_binds {
             // admin_servers.push(tokio::spawn(admin_server(options.clone(), addr, port, false, reload.recv())));
         }
+
+        select! {
+            _ = tokio::signal::ctrl_c() => break,
+            _ = reload.recv() => {}
+        }
+        state.logger.info((), "pausing accepts for reload");
+
+        for (cancel, server) in plain_servers.into_iter().chain(tls_servers.into_iter()) {
+            cancel.cancel();
+            server.await??;
+        }
+
+        state.logger.info((), "reloading");
     }
 
-    tokio::spawn(async move {
-        loop {
-            reload.recv().await;
-            logger.info((), "reloading");
-        }
-    });
+    Ok(())
 }
 
 async fn tls_server(
@@ -133,6 +150,8 @@ async fn tls_server(
     let acceptor = TlsAcceptor::from(Arc::new(config));
     let listener = TcpListener::bind(addr).await?;
 
+    state.logger.info(vars! { addr }, "tls listen started");
+
     loop {
         let (stream, peer_addr) = select! {
             v = listener.accept() => v?,
@@ -144,6 +163,34 @@ async fn tls_server(
 
         tokio::spawn(async move {
             let stream = acceptor.accept(stream).await.expect("TODO");
+            run_worker(stream, peer_addr, state);
+        });
+    }
+
+    drop(acceptor);
+    drop(listener);
+
+    Ok(())
+}
+
+async fn plain_server(
+    addr: SocketAddr,
+    cancel: CancellationToken,
+    state: Arc<State>,
+) -> Result<()> {
+    let listener = TcpListener::bind(addr).await?;
+
+    state.logger.info(vars! { addr }, "plain listen started");
+
+    loop {
+        let (stream, peer_addr) = select! {
+            v = listener.accept() => v?,
+            _ = cancel.cancelled() => break,
+        };
+
+        let state = Arc::clone(&state);
+
+        tokio::spawn(async move {
             run_worker(stream, peer_addr, state);
         });
     }
