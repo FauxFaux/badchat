@@ -9,20 +9,20 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::admin::run_admin;
-use crate::tempura::{add_keepalives, load_certs, load_keys};
-use crate::worker::run_worker;
+use super::{MessageIn, MessageOut, Uid};
+use admin::run_admin;
 use anyhow::{anyhow, bail, Context, Result};
-use badchat::{MessageIn, MessageOut, Uid};
 use bunyarrs::{vars, vars_dbg, Bunyarr};
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
+use tempura::{add_keepalives, load_certs, load_keys};
 use tokio::net::TcpListener;
 use tokio::select;
 use tokio::signal::unix::SignalKind;
 use tokio::time::timeout;
 use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
+use worker::run_worker;
 
 #[derive(serde::Deserialize, Clone)]
 struct Options {
@@ -42,8 +42,7 @@ struct Client {
     write: tokio::sync::mpsc::Sender<MessageOut>,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+pub async fn main() -> Result<()> {
     let logger = Bunyarr::with_name("main");
 
     let options: Options = config::Config::builder()

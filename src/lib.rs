@@ -42,6 +42,8 @@ mod proto;
 mod rhost;
 mod store;
 
+pub mod lined;
+
 type ConnId = Uid;
 
 const INPUT_LENGTH_LIMIT: usize = 4_096;

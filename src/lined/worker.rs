@@ -2,15 +2,15 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use badchat::{MessageIn, MessageOut, Uid};
 use bunyarrs::vars_dbg;
 use tokio::io::AsyncWriteExt;
 use tokio::io::{split, AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite};
 use tokio::select;
 use tokio_util::sync::CancellationToken;
 
-use crate::tempura::uuid;
-use crate::{Client, State};
+use super::tempura::uuid;
+use super::{Client, State};
+use crate::{MessageIn, MessageOut, Uid};
 
 pub fn run_worker<RW: AsyncRead + AsyncWrite + Send + 'static>(
     stream: RW,
