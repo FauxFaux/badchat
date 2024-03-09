@@ -1,9 +1,10 @@
 use anyhow::Result;
-use bincode::config as bc;
 use bincode::de::{BorrowDecoder, Decoder};
 use bincode::enc::Encoder;
 use bincode::error::DecodeError;
+use bincode::{config as bc, Decode, Encode};
 use std::net::SocketAddr;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use uuid::Uuid;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
@@ -71,4 +72,22 @@ pub fn decode<T: bincode::Decode>(v: &[u8]) -> Result<T> {
     let (a, b) = bincode::decode_from_slice(&v, CONFIG)?;
     ensure!(b == v.len(), "not all bytes were read");
     Ok(a)
+}
+
+/// not cancellation safe; may have read from reader
+pub async fn read_message<T: Decode>(
+    buf: &mut Vec<u8>,
+    mut r: impl AsyncRead + Unpin,
+) -> Result<T> {
+    let len = usize::from(r.read_u16_le().await?);
+    buf.resize(len, 0);
+    r.read_exact(buf).await?;
+    decode(&buf)
+}
+
+pub async fn write_message<T: Encode>(mut w: impl AsyncWrite + Unpin, v: T) -> Result<()> {
+    let buf = encode(v)?;
+    w.write_u16_le(u16::try_from(buf.len())?).await?;
+    w.write_all(&buf).await?;
+    Ok(())
 }

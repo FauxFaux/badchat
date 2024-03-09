@@ -28,7 +28,9 @@ use self::proto::Command;
 use self::proto::ParsedMessage as Message;
 use self::store::Store;
 
-pub use crate::lined_shared::{decode, encode, FromLined, MessageIn, MessageOut, ToLined, Uid};
+pub use crate::lined_shared::{
+    decode, encode, read_message, write_message, FromLined, MessageIn, MessageOut, ToLined, Uid,
+};
 
 mod err;
 mod ids;
@@ -755,12 +757,10 @@ async fn main() -> Result<()> {
     let mut js = JoinSet::new();
 
     js.spawn(async move {
-        let mut buf = Vec::with_capacity(usize::from(u16::MAX));
+        let mut buf = Vec::with_capacity(4096 + 32);
         loop {
-            let len = usize::from(read.read_u16_le().await?);
-            buf.resize(len, 0);
-            read.read_exact(&mut buf).await?;
-            from_lined_tx.send(decode(&buf)?).await?;
+            let value = read_message(&mut buf, &mut read).await?;
+            from_lined_tx.send(value).await?;
         }
 
         Ok::<(), anyhow::Error>(())
@@ -768,10 +768,7 @@ async fn main() -> Result<()> {
 
     js.spawn(async move {
         while let Some(obj) = to_lined_rx.recv().await {
-            let buf = encode(obj)?;
-            let len = u16::try_from(buf.len())?;
-            write.write_u16_le(len).await?;
-            write.write_all(&buf).await?;
+            write_message(&mut write, obj).await?;
         }
         Ok::<(), anyhow::Error>(())
     });

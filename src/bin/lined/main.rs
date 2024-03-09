@@ -7,18 +7,20 @@ use std::io::{self};
 use std::net::{Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use crate::admin::run_admin;
 use crate::tempura::{add_keepalives, load_certs, load_keys};
 use crate::worker::run_worker;
 use anyhow::{anyhow, bail, Context, Result};
 use badchat::{MessageIn, MessageOut, Uid};
-use bunyarrs::{vars, Bunyarr};
+use bunyarrs::{vars, vars_dbg, Bunyarr};
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 use tokio::net::TcpListener;
 use tokio::select;
 use tokio::signal::unix::SignalKind;
+use tokio::time::timeout;
 use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
 
@@ -190,7 +192,19 @@ async fn tls_server(
         let state = Arc::clone(&state);
 
         tokio::spawn(async move {
-            let stream = acceptor.accept(stream).await.expect("TODO");
+            let stream = match timeout(Duration::from_secs(2), acceptor.accept(stream)).await {
+                Ok(Ok(stream)) => stream,
+                Ok(Err(err)) => {
+                    state
+                        .logger
+                        .info(vars_dbg! { addr, err }, "tls accept failed");
+                    return;
+                }
+                Err(_timeout_elapsed) => {
+                    state.logger.info(vars! { addr }, "tls accept timed out");
+                    return;
+                }
+            };
             run_worker(stream, peer_addr, state);
         });
     }
