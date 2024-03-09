@@ -245,6 +245,8 @@ async fn tls_server(
             _ = cancel.cancelled() => break,
         };
 
+        add_keepalives(&stream)?;
+
         let acceptor = acceptor.clone();
         let state = Arc::clone(&state);
 
@@ -275,6 +277,8 @@ async fn plain_server(
             _ = cancel.cancelled() => break,
         };
 
+        add_keepalives(&stream)?;
+
         let state = Arc::clone(&state);
 
         tokio::spawn(async move {
@@ -299,6 +303,8 @@ async fn admin_server(
             v = listener.accept() => v?,
             _ = cancel.cancelled() => break,
         };
+
+        add_keepalives(&stream)?;
 
         let state = Arc::clone(&state);
 
@@ -480,4 +486,15 @@ async fn read_until_limit(
 
 fn uuid() -> Uuid {
     Uuid::new_v7(uuid::Timestamp::now(NoContext))
+}
+
+fn add_keepalives(stream: &tokio::net::TcpStream) -> Result<()> {
+    use std::time::Duration;
+
+    let sock_ref = socket2::SockRef::from(stream);
+    let ka = socket2::TcpKeepalive::new()
+        .with_time(Duration::from_secs(60))
+        .with_interval(Duration::from_secs(60));
+    sock_ref.set_tcp_keepalive(&ka)?;
+    Ok(())
 }
