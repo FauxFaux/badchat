@@ -21,6 +21,8 @@ use self::proto::Command;
 use self::proto::ParsedMessage as Message;
 use self::store::Store;
 
+pub use lined_shared::Uid;
+
 mod err;
 mod ids;
 mod in_map;

@@ -1,72 +1,31 @@
+mod admin;
+mod tempura;
+mod worker;
+
 use std::collections::HashMap;
-use std::fs::File;
-use std::future::Future;
-use std::io::{self, BufReader};
-use std::net::{Ipv6Addr, SocketAddr, ToSocketAddrs};
-use std::path::{Path, PathBuf};
+use std::io::{self};
+use std::net::{Ipv6Addr, SocketAddr};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use crate::admin::run_admin;
+use crate::tempura::{add_keepalives, load_certs, load_keys};
+use crate::worker::run_worker;
 use anyhow::{anyhow, bail, Context, Result};
-use bincode::de::{BorrowDecoder, Decoder};
-use bincode::enc::Encoder;
-use bincode::error::DecodeError;
-use bunyarrs::{vars, vars_dbg, Bunyarr};
+use badchat::Uid;
+use bunyarrs::{vars, Bunyarr};
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
-use rustls_pemfile::{certs, pkcs8_private_keys, rsa_private_keys};
-use rustls_pki_types::{CertificateDer, PrivateKeyDer};
-use tokio::io::{
-    copy, sink, split, AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt,
-    BufStream,
-};
 use tokio::net::TcpListener;
 use tokio::select;
 use tokio::signal::unix::SignalKind;
 use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
-use uuid::{Bytes, NoContext, Uuid};
 
 #[derive(serde::Deserialize, Clone)]
 struct Options {
     cert: PathBuf,
     key: PathBuf,
-}
-
-fn load_certs(path: &Path) -> io::Result<Vec<CertificateDer<'static>>> {
-    certs(&mut BufReader::new(File::open(path)?)).collect()
-}
-
-fn load_keys(path: &Path) -> io::Result<PrivateKeyDer<'static>> {
-    pkcs8_private_keys(&mut BufReader::new(File::open(path)?))
-        .next()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput,
-              "no rsa keys found (only pkcs8 / BEGIN PRIVATE KEY, i.e. not pkcs1 / BEGIN RSA PRIVATE KEY, is supported)"))?
-        .map(Into::into)
-}
-
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
-struct Uid(Uuid);
-
-impl bincode::Encode for Uid {
-    fn encode<E: Encoder>(
-        &self,
-        e: &mut E,
-    ) -> std::result::Result<(), bincode::error::EncodeError> {
-        self.0.as_bytes().encode(e)
-    }
-}
-
-impl bincode::Decode for Uid {
-    fn decode<D: Decoder>(d: &mut D) -> std::result::Result<Self, bincode::error::DecodeError> {
-        Ok(Uid(Uuid::from_bytes(<[u8; 16]>::decode(d)?)))
-    }
-}
-
-impl<'de> bincode::BorrowDecode<'de> for Uid {
-    fn borrow_decode<D: BorrowDecoder<'de>>(d: &mut D) -> std::result::Result<Self, DecodeError> {
-        use bincode::Decode;
-        Ok(Uid(Uuid::from_bytes(<[u8; 16]>::decode(d)?)))
-    }
 }
 
 #[derive(bincode::Encode, bincode::Decode, Debug)]
@@ -103,7 +62,7 @@ struct Client {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let logger = bunyarrs::Bunyarr::with_name("main");
+    let logger = Bunyarr::with_name("main");
 
     let options: Options = config::Config::builder()
         .add_source(config::Environment::with_prefix("LINED"))
@@ -313,188 +272,5 @@ async fn admin_server(
         });
     }
 
-    Ok(())
-}
-
-fn run_worker<RW: AsyncRead + AsyncWrite + Send + 'static>(
-    stream: RW,
-    peer_addr: SocketAddr,
-    state: Arc<State>,
-) {
-    let (reader, mut writer) = split(stream);
-    let mut reader = tokio::io::BufReader::new(reader);
-
-    let id = Uid(uuid());
-    let (tx, mut rx) = tokio::sync::mpsc::channel(16);
-    state.clients.lock().expect("poisoned").insert(
-        id,
-        Client {
-            peer_addr,
-            write: tx,
-        },
-    );
-
-    let state_for_write = Arc::clone(&state);
-
-    tokio::spawn(async move {
-        let logger = bunyarrs::Bunyarr::with_name("read-worker");
-        if let Err(_) = state
-            .inbound_tx
-            .send((id, MessageIn::Connected(peer_addr)))
-            .await
-        {
-            logger.warn((), "unable to notify of connection, aborting");
-            return;
-        }
-        loop {
-            let buf = match read_until_limit(&mut reader, 4096).await {
-                Ok(buf) => buf,
-                Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => {
-                    logger.debug(vars_dbg! { id, peer_addr }, "client closed connection");
-                    break;
-                }
-                Err(err) if err.kind() == io::ErrorKind::InvalidData => {
-                    logger.info(vars_dbg! { id, peer_addr }, "client overflowed");
-                    let _irrelevant_as_breaking = state.inbound_tx.send((id, MessageIn::Overflow));
-                    break;
-                }
-                Err(err) => {
-                    logger.warn(
-                        vars_dbg! { id, peer_addr, err },
-                        "client read failed with unexpected error",
-                    );
-                    break;
-                }
-            };
-
-            // they've gone away, so stop accepting messages from them
-            if !state.clients.lock().expect("poisoned").contains_key(&id) {
-                break;
-            }
-
-            let Ok(buf) = String::from_utf8(buf) else {
-                if let Err(_) = state.inbound_tx.send((id, MessageIn::InvalidUtf8)).await {
-                    break;
-                }
-                continue;
-            };
-            if let Err(_) = state.inbound_tx.send((id, MessageIn::Data(buf))).await {
-                break;
-            }
-        }
-
-        let _ = state.inbound_tx.send((id, MessageIn::Closed)).await;
-        drop(reader);
-    });
-
-    let state = state_for_write;
-
-    tokio::spawn(async move {
-        let logger = bunyarrs::Bunyarr::with_name("write-worker");
-        loop {
-            let Some(bytes) = rx.recv().await else {
-                break;
-            };
-            match bytes {
-                MessageOut::Data(bytes) => match writer.write_all(bytes.as_bytes()).await {
-                    Ok(_) => {}
-                    Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => {
-                        break;
-                    }
-                    Err(err) => {
-                        logger.warn(vars_dbg! { id, peer_addr, err }, "write failed");
-                        break;
-                    }
-                },
-                MessageOut::Close => break,
-            }
-        }
-        let _ = state.inbound_tx.send((id, MessageIn::Closed));
-        if let Err(err) = writer.shutdown().await {
-            logger.info(vars_dbg! { id, peer_addr, err }, "shutdown failed");
-        }
-    });
-}
-
-fn run_admin<RW: AsyncRead + AsyncWrite + Send + 'static>(
-    stream: RW,
-    peer_addr: SocketAddr,
-    state: Arc<State>,
-) {
-    let (reader, mut writer) = split(stream);
-    let mut reader = tokio::io::BufReader::new(reader);
-
-    let state_for_write = Arc::clone(&state);
-
-    tokio::spawn(async move {
-        let mut buf = String::with_capacity(1024);
-        loop {
-            buf.clear();
-            let num = reader.read_line(&mut buf).await.expect("todo");
-            if num == 0 {
-                break;
-            }
-            println!("{}", buf);
-        }
-    });
-
-    let state = state_for_write;
-    tokio::spawn(async move {
-        loop {
-            let mut inbound_rx = state.inbound_rx.lock().await;
-
-            loop {
-                let (client, msg) = inbound_rx.recv().await.expect("todo");
-                let data = format!("{:?} {:?}", client, msg);
-                println!("{}", data);
-                if let Err(_) = writer.write_all(data.as_bytes()).await {
-                    break;
-                }
-            }
-        }
-    });
-}
-
-async fn read_until_limit(
-    mut reader: impl AsyncBufRead + Unpin,
-    limit: usize,
-) -> io::Result<Vec<u8>> {
-    let mut buf = Vec::<u8>::with_capacity(limit);
-    loop {
-        let seen = reader.fill_buf().await?;
-        if seen.is_empty() {
-            return Err(io::ErrorKind::UnexpectedEof.into());
-        }
-        let (found, end) = match seen.iter().position(|&b| b == b'\n') {
-            Some(end) => (true, end),
-            None => (false, seen.len()),
-        };
-        buf.extend_from_slice(&seen[..end]);
-        reader.consume(end);
-        if found {
-            // Consume the newline
-            reader.consume(1);
-            break;
-        }
-        if buf.len() > limit {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "line too long"));
-        }
-    }
-
-    Ok(buf)
-}
-
-fn uuid() -> Uuid {
-    Uuid::new_v7(uuid::Timestamp::now(NoContext))
-}
-
-fn add_keepalives(stream: &tokio::net::TcpStream) -> Result<()> {
-    use std::time::Duration;
-
-    let sock_ref = socket2::SockRef::from(stream);
-    let ka = socket2::TcpKeepalive::new()
-        .with_time(Duration::from_secs(60))
-        .with_interval(Duration::from_secs(60));
-    sock_ref.set_tcp_keepalive(&ka)?;
     Ok(())
 }
