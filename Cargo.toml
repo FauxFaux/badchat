@@ -9,12 +9,14 @@ anyhow = "1"
 bincode = { version = "2.0.0-rc.3", features = ["serde"] }
 bunyarrs = "0.2"
 config = "0.14"
-dns-lookup = "1"
-env_logger = "0.8"
+dns-lookup = "2"
+env_logger = "0.11"
 futures = "0.3"
 log = "0.4.6"
 maplit = "1"
+pbkdf2 = { version = "0.12", features = ["simple"] }
 rand = "0.8"
+rusqlite = { version = "0.31", features = ["bundled"] }
 rustls = "0.22"
 rustls-pemfile = "2.1.0"
 rustls-pki-types = "1"
@@ -25,11 +27,3 @@ tokio = { version = "1", features = ["full"] }
 tokio-rustls = "0.25"
 tokio-util = "0.7"
 uuid = { version = "1.7", features = ["v7", "serde"] }
-
-[dependencies.pbkdf2]
-version = "0.8"
-features = ["simple"]
-
-[dependencies.rusqlite]
-version = "0.25"
-features = ["bundled"]
