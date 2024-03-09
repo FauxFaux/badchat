@@ -3,12 +3,9 @@ use std::env;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    match env::args().nth(1) {
-        Some(arg) => match arg.as_str() {
-            "lined" => return badchat::lined::main().await,
-            _ => (),
-        },
-        None => (),
+    match env::args().nth(1).as_deref() {
+        Some("lined") => return badchat::lined::main().await,
+        _ => (),
     }
     Err(anyhow!("usage: badchat lined"))
 }

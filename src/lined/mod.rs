@@ -6,19 +6,22 @@ use std::collections::HashMap;
 use std::io::{self};
 use std::net::{Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicI16, AtomicU16};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use super::{MessageIn, MessageOut, Uid};
+use super::{read_message, FromLined, MessageIn, MessageOut, Uid};
 use admin::run_admin;
 use anyhow::{anyhow, bail, Context, Result};
 use bunyarrs::{vars, vars_dbg, Bunyarr};
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 use tempura::{add_keepalives, load_certs, load_keys};
-use tokio::net::TcpListener;
+use tokio::io::AsyncWriteExt;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::select;
 use tokio::signal::unix::SignalKind;
+use tokio::task::JoinSet;
 use tokio::time::timeout;
 use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
@@ -58,14 +61,8 @@ pub async fn main() -> Result<()> {
     let admin_binds = [(Ipv6Addr::LOCALHOST, 6766)];
 
     let mut reload = tokio::signal::unix::signal(SignalKind::hangup())?;
-    let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel(128);
 
-    let state = Arc::new(State {
-        clients: Mutex::new(HashMap::new()),
-        inbound_tx,
-        inbound_rx: tokio::sync::Mutex::new(inbound_rx),
-        logger,
-    });
+    let state = make_state(logger);
 
     loop {
         let mut cancels = Vec::new();
@@ -89,6 +86,7 @@ pub async fn main() -> Result<()> {
                     (addr, port).into(),
                     cancel,
                     Arc::clone(&state),
+                    |_| {},
                 ));
             }
         }
@@ -99,6 +97,7 @@ pub async fn main() -> Result<()> {
                 (addr, port).into(),
                 cancel,
                 Arc::clone(&state),
+                |_| {},
             ));
         }
 
@@ -154,6 +153,19 @@ pub async fn main() -> Result<()> {
         .info((), "shutdown complete; killing remaining clients");
 
     Ok(())
+}
+
+pub fn make_state(logger: Bunyarr) -> Arc<State> {
+    let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel(128);
+
+    let state = Arc::new(State {
+        clients: Mutex::new(HashMap::new()),
+        inbound_tx,
+        inbound_rx: tokio::sync::Mutex::new(inbound_rx),
+        logger,
+    });
+
+    state
 }
 
 async fn tls_server(
@@ -218,8 +230,11 @@ async fn plain_server(
     addr: SocketAddr,
     cancel: CancellationToken,
     state: Arc<State>,
+    on_port: impl FnOnce(u16) -> (),
 ) -> Result<()> {
     let listener = TcpListener::bind(addr).await?;
+    let addr = listener.local_addr()?;
+    on_port(addr.port());
 
     state.logger.info(vars! { addr }, "plain listen started");
 
@@ -245,8 +260,11 @@ async fn admin_server(
     addr: SocketAddr,
     cancel: CancellationToken,
     state: Arc<State>,
+    on_port: impl FnOnce(u16) -> (),
 ) -> Result<()> {
     let listener = TcpListener::bind(addr).await?;
+    let addr = listener.local_addr()?;
+    on_port(addr.port());
 
     state.logger.info(vars! { addr }, "admin listen started");
 
@@ -263,6 +281,66 @@ async fn admin_server(
         tokio::spawn(async move {
             run_admin(stream, peer_addr, state);
         });
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_plain_chat() -> Result<()> {
+    let state = make_state(Bunyarr::with_name("test"));
+    let cancel = CancellationToken::new();
+    let (p_port_s, p_port_r) = tokio::sync::oneshot::channel();
+    let (a_port_s, a_port_r) = tokio::sync::oneshot::channel();
+
+    let mut js = JoinSet::new();
+    js.spawn(plain_server(
+        (Ipv6Addr::LOCALHOST, 0).into(),
+        cancel.clone(),
+        Arc::clone(&state),
+        move |v| {
+            p_port_s.send(v).unwrap();
+        },
+    ));
+    js.spawn(admin_server(
+        (Ipv6Addr::LOCALHOST, 0).into(),
+        cancel.clone(),
+        Arc::clone(&state),
+        move |v| {
+            a_port_s.send(v).unwrap();
+        },
+    ));
+
+    let p_port = p_port_r.await?;
+    let a_port = a_port_r.await?;
+
+    let mut p = TcpStream::connect((Ipv6Addr::LOCALHOST, p_port)).await?;
+    let mut a = TcpStream::connect((Ipv6Addr::LOCALHOST, a_port)).await?;
+
+    p.write_all(b"hello\n").await?;
+    p.flush().await?;
+    p.shutdown().await?;
+
+    let msg = read_message::<FromLined>(&mut Vec::new(), &mut a).await?;
+    assert!(
+        matches!(msg, FromLined::Message(_, MessageIn::Connected(_))),
+        "client should connect: {msg:?}"
+    );
+    let msg = read_message::<FromLined>(&mut Vec::new(), &mut a).await?;
+    assert!(
+        matches!(msg, FromLined::Message(_, MessageIn::Data(_))),
+        "client should speak: {msg:?}"
+    );
+    let msg = read_message::<FromLined>(&mut Vec::new(), &mut a).await?;
+    assert!(
+        matches!(msg, FromLined::Message(_, MessageIn::Closed)),
+        "client should disconnect {msg:?}"
+    );
+
+    cancel.cancel();
+
+    while let Some(task) = js.join_next().await {
+        task??;
     }
 
     Ok(())

@@ -10,12 +10,12 @@ use uuid::Uuid;
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub struct Uid(pub Uuid);
 
-#[derive(bincode::Encode, bincode::Decode, Debug)]
+#[derive(bincode::Encode, bincode::Decode, Debug, PartialEq, Eq, Hash)]
 pub enum FromLined {
     Message(Uid, MessageIn),
 }
 
-#[derive(bincode::Encode, bincode::Decode, Debug)]
+#[derive(bincode::Encode, bincode::Decode, Debug, PartialEq, Eq, Hash)]
 pub enum MessageIn {
     Data(String),
     Connected(SocketAddr),
