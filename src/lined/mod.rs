@@ -1,16 +1,15 @@
 mod admin;
 mod tempura;
+mod wire;
 mod worker;
 
 use std::collections::HashMap;
 use std::io::{self};
 use std::net::{Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicI16, AtomicU16};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use super::{read_message, FromLined, MessageIn, MessageOut, Uid};
 use admin::run_admin;
 use anyhow::{anyhow, bail, Context, Result};
 use bunyarrs::{vars, vars_dbg, Bunyarr};
@@ -26,6 +25,8 @@ use tokio::time::timeout;
 use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
 use worker::run_worker;
+
+pub use wire::{read_message, write_message, FromLined, MessageIn, MessageOut, ToLined, Uid};
 
 #[derive(serde::Deserialize, Clone)]
 struct Options {

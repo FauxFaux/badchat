@@ -9,8 +9,8 @@ use tokio::select;
 use tokio_util::sync::CancellationToken;
 
 use super::tempura::uuid;
+use super::wire::{MessageIn, MessageOut, Uid};
 use super::{Client, State};
-use crate::{MessageIn, MessageOut, Uid};
 
 pub fn run_worker<RW: AsyncRead + AsyncWrite + Send + 'static>(
     stream: RW,

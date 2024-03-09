@@ -5,11 +5,8 @@ extern crate log;
 
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::collections::VecDeque;
-use std::convert::TryFrom;
 use std::mem;
 use std::net::Ipv6Addr;
-use std::sync::Arc;
 
 use anyhow::Result;
 use futures::StreamExt;
@@ -19,23 +16,19 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::task::JoinSet;
 
+use lined::{read_message, write_message, FromLined, MessageIn, MessageOut, ToLined, Uid};
+
 use self::ids::ChannelName;
 use self::ids::HostMask;
 use self::ids::Nick;
-use self::in_map::LazyView;
 use self::in_map::MapBorrow;
 use self::proto::Command;
 use self::proto::ParsedMessage as Message;
 use self::store::Store;
 
-pub use crate::lined_shared::{
-    decode, encode, read_message, write_message, FromLined, MessageIn, MessageOut, ToLined, Uid,
-};
-
 mod err;
 mod ids;
 mod in_map;
-mod lined_shared;
 mod pbkdf2;
 mod pre;
 mod proto;

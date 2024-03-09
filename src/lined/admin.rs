@@ -2,12 +2,11 @@ use bunyarrs::vars_dbg;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use crate::{read_message, write_message, FromLined, MessageIn, ToLined};
-use tokio::io::AsyncWriteExt;
 use tokio::io::{split, AsyncRead, AsyncWrite};
 use tokio::select;
 use tokio_util::sync::CancellationToken;
 
+use super::wire::{read_message, write_message, FromLined, MessageIn, ToLined};
 use super::State;
 
 pub fn run_admin<RW: AsyncRead + AsyncWrite + Send + 'static>(
