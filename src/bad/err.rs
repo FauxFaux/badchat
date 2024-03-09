@@ -1,8 +1,8 @@
 //! * https://modern.ircdocs.horse/#errunknownerror-400
 //! * https://www.alien.net.au/irc/irc2numerics.html
 
-use crate::ids::Nick;
-use crate::OutCommand;
+use super::ids::Nick;
+use super::OutCommand;
 
 // Note: the horse docs use "<client>" to mean "ident", i.e. `Faux!faux@localhost`
 

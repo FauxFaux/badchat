@@ -7,11 +7,11 @@ use rusqlite::types::ToSql;
 use rusqlite::Transaction;
 use rusqlite::{Connection, Params};
 
-use crate::ids::ChannelName;
+use super::ids::ChannelName;
+use super::ChannelId;
+use super::Pass;
 use crate::pbkdf2::pbkdf2_check;
 use crate::pbkdf2::pbkdf2_simple;
-use crate::ChannelId;
-use crate::Pass;
 
 pub struct Store {
     conn: Connection,

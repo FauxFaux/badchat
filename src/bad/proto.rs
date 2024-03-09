@@ -1,6 +1,6 @@
 use std::ops::Range;
 
-use crate::ids::Nick;
+use super::ids::Nick;
 
 #[derive(Copy, Clone, Debug)]
 pub enum Command<'s> {

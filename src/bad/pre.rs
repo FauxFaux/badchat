@@ -1,13 +1,13 @@
-use crate::err;
-use crate::ids::valid_account;
-use crate::ids::Nick;
-use crate::proto::Command;
-use crate::proto::ParsedMessage as Message;
-use crate::OutCommand;
-use crate::Pass;
-use crate::PingToken;
-use crate::PreAuth;
-use crate::PreAuthPing;
+use super::err;
+use super::ids::valid_account;
+use super::ids::Nick;
+use super::proto::Command;
+use super::proto::ParsedMessage as Message;
+use super::OutCommand;
+use super::Pass;
+use super::PingToken;
+use super::PreAuth;
+use super::PreAuthPing;
 
 #[derive(Clone, Debug)]
 pub enum PreAuthOp {
