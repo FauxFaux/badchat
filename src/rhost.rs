@@ -3,8 +3,6 @@ use std::net::IpAddr;
 use std::sync::mpsc;
 use std::thread;
 
-use dns_lookup;
-
 #[derive(Debug)]
 enum State {
     Waiting(mpsc::Receiver<Option<String>>),

@@ -17,3 +17,12 @@ pub fn pbkdf2_check(pass: &str, hash: &str) -> Result<bool> {
     let hash = PasswordHash::new(hash).map_err(|e| anyhow!("{:?}", e))?;
     Ok(Pbkdf2.verify_password(pass.as_bytes(), &hash).is_ok())
 }
+
+#[test]
+fn test_pbkdf2() -> Result<()> {
+    let pass = "password";
+    let hash = pbkdf2_simple(pass)?;
+    assert!(pbkdf2_check(pass, &hash)?);
+    assert!(!pbkdf2_check("wrong", &hash)?);
+    Ok(())
+}

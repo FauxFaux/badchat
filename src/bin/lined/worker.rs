@@ -2,13 +2,15 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use badchat::Uid;
+use badchat::{MessageIn, MessageOut, Uid};
 use bunyarrs::vars_dbg;
 use tokio::io::AsyncWriteExt;
 use tokio::io::{split, AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite};
+use tokio::select;
+use tokio_util::sync::CancellationToken;
 
 use crate::tempura::uuid;
-use crate::{Client, MessageIn, MessageOut, State};
+use crate::{Client, State};
 
 pub fn run_worker<RW: AsyncRead + AsyncWrite + Send + 'static>(
     stream: RW,
@@ -28,7 +30,10 @@ pub fn run_worker<RW: AsyncRead + AsyncWrite + Send + 'static>(
         },
     );
 
+    let local_cancel = CancellationToken::new();
+
     let state_for_write = Arc::clone(&state);
+    let local_cancel_for_write = local_cancel.clone();
 
     tokio::spawn(async move {
         let logger = bunyarrs::Bunyarr::with_name("read-worker");
@@ -41,7 +46,13 @@ pub fn run_worker<RW: AsyncRead + AsyncWrite + Send + 'static>(
             return;
         }
         loop {
-            let buf = match read_until_limit(&mut reader, 4096).await {
+            // read_until_limit isn't cancel safe (the reader will have been partially consumed);
+            // we must drop the reader if we are cancelled
+            let read = select! {
+                _ = local_cancel.cancelled() => break,
+                read = read_until_limit(&mut reader, 4096) => read,
+            };
+            let buf = match read {
                 Ok(buf) => buf,
                 Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => {
                     logger.debug(vars_dbg! { id, peer_addr }, "client closed connection");
@@ -77,16 +88,26 @@ pub fn run_worker<RW: AsyncRead + AsyncWrite + Send + 'static>(
             }
         }
 
-        let _ = state.inbound_tx.send((id, MessageIn::Closed)).await;
+        // we can get here because we were cancelled or errored;
+        // we must drop the reader, as it may be in an unexpected state
         drop(reader);
+
+        let _ = state.inbound_tx.send((id, MessageIn::Closed)).await;
+        local_cancel.cancel();
     });
 
     let state = state_for_write;
+    let local_cancel = local_cancel_for_write;
 
     tokio::spawn(async move {
         let logger = bunyarrs::Bunyarr::with_name("write-worker");
+        let mut flush = true;
         loop {
-            let Some(bytes) = rx.recv().await else {
+            let read = select! {
+                _ = local_cancel.cancelled() => break,
+                read = rx.recv() => read,
+            };
+            let Some(bytes) = read else {
                 break;
             };
             match bytes {
@@ -100,13 +121,27 @@ pub fn run_worker<RW: AsyncRead + AsyncWrite + Send + 'static>(
                         break;
                     }
                 },
-                MessageOut::Close => break,
+                MessageOut::FlushAndClose => break,
+                MessageOut::Terminate => {
+                    flush = false;
+                    break;
+                }
+            }
+        }
+        if flush {
+            if let Err(err) = writer.flush().await {
+                logger.info(
+                    vars_dbg! { id, peer_addr, err },
+                    "flush during shutdown failed",
+                );
+            }
+            if let Err(err) = writer.shutdown().await {
+                logger.info(vars_dbg! { id, peer_addr, err }, "shutdown failed");
             }
         }
         let _ = state.inbound_tx.send((id, MessageIn::Closed));
-        if let Err(err) = writer.shutdown().await {
-            logger.info(vars_dbg! { id, peer_addr, err }, "shutdown failed");
-        }
+        drop(writer);
+        local_cancel.cancel();
     });
 }
 

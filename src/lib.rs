@@ -6,11 +6,18 @@ extern crate log;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
+use std::convert::TryFrom;
 use std::mem;
+use std::net::Ipv6Addr;
 use std::sync::Arc;
 
-use anyhow::Error;
+use anyhow::Result;
+use futures::StreamExt;
 use rand::Rng;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::TcpStream;
+use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::task::JoinSet;
 
 use self::ids::ChannelName;
 use self::ids::HostMask;
@@ -21,7 +28,7 @@ use self::proto::Command;
 use self::proto::ParsedMessage as Message;
 use self::store::Store;
 
-pub use lined_shared::Uid;
+pub use crate::lined_shared::{decode, encode, FromLined, MessageIn, MessageOut, ToLined, Uid};
 
 mod err;
 mod ids;
@@ -31,10 +38,9 @@ mod pbkdf2;
 mod pre;
 mod proto;
 mod rhost;
-mod serv;
 mod store;
 
-type ConnId = mio::Token;
+type ConnId = Uid;
 
 const INPUT_LENGTH_LIMIT: usize = 4_096;
 
@@ -141,8 +147,8 @@ enum Req {
 
 #[derive(Copy, Clone, Debug)]
 enum FromTo {
-    LinkManagement(mio::Token),
-    ServerToClient(mio::Token),
+    LinkManagement(Uid),
+    ServerToClient(Uid),
     ServerToUser(UserId),
     UserToUser(UserId, UserId),
 }
@@ -189,7 +195,7 @@ fn s2u<S: ToString, I: IntoIterator<Item = S>>(to: UserId, cmd: &'static str, ar
 }
 
 impl System {
-    fn new() -> Result<System, Error> {
+    fn new() -> Result<System> {
         Ok(System {
             store: store::Store::new()?,
             clients: HashMap::new(),
@@ -200,63 +206,34 @@ impl System {
         })
     }
 
-    fn work(&mut self, tokens: &HashSet<mio::Token>, connections: &mut serv::Connections) {
-        let mut output = Vec::with_capacity(4 * tokens.len());
-
-        for token in tokens {
-            output.extend(work_conn(
-                &mut self.store,
-                &mut self.clients,
-                &mut self.users,
-                *token,
-                connections
-                    .get_mut(token)
-                    .expect("server said there was work for a connection, but it's gone"),
-            ));
-        }
-
-        for Output {
-            from_to,
-            tags: (),
-            cmd_and_args,
-            then_close,
-        } in output
-        {
-            let dest = match from_to {
-                FromTo::UserToUser(_, to) | FromTo::ServerToUser(to) => {
-                    find_user(&self.clients, to)
+    async fn run(&mut self, mut inp: Receiver<FromLined>, out: Sender<ToLined>) -> Result<()> {
+        while let Some(msg) = inp.recv().await {
+            match msg {
+                FromLined::Message(uid, msg_in) => {
+                    match msg_in {
+                        MessageIn::Data(text) => {
+                            out.send(ToLined::Message(
+                                uid,
+                                MessageOut::Data(format!("hello, {text}")),
+                            ))
+                            .await?
+                        }
+                        _ => {
+                            out.send(ToLined::Message(
+                                uid,
+                                MessageOut::Data(format!("not implemented")),
+                            ))
+                            .await?
+                        }
+                    };
                 }
-                FromTo::ServerToClient(client) | FromTo::LinkManagement(client) => client,
-            };
-
-            let prefix = match from_to {
-                FromTo::UserToUser(from, _) => match self.users.data.get(&from) {
-                    Some(user) => format!(":{}!~@. ", user.nick),
-                    None => {
-                        warn!("invalid-user: {:?} from from_to: {:?}", from, from_to);
-                        continue;
-                    }
-                },
-                FromTo::ServerToUser(_) | FromTo::ServerToClient(_) => ":ircd ".to_string(),
-                FromTo::LinkManagement(_) => String::new(),
-            };
-
-            if let Some(conn) = connections.get_mut(&dest) {
-                let line = format!("{}{}", prefix, cmd_and_args.render());
-                if let Err(e) = conn.write_line(line) {
-                    info!("{:?}: error sending normal message: {:?}", dest, e);
-                    conn.start_closing();
-                } else if then_close {
-                    conn.start_closing();
-                }
-            } else {
-                warn!("invalid-dest: {:?} from from_to: {:?}", dest, from_to);
             }
         }
+        Ok(())
     }
 }
 
-fn find_user(clients: &Clients, which: UserId) -> mio::Token {
+fn find_user(clients: &Clients, which: UserId) -> Uid {
     for (token, client) in clients {
         match client {
             Client::PreAuth { .. } => (),
@@ -308,61 +285,10 @@ impl OutCommand {
     }
 }
 
-fn work_conn(
-    store: &mut Store,
-    clients: &mut Clients,
-    users: &mut Users,
-    us: mio::Token,
-    conn: &mut serv::Conn,
-) -> Vec<Output> {
-    let mut output = Vec::with_capacity(4);
-
-    for message in take_messages(conn) {
-        let message = match message {
-            Ok(message) => message,
-            Err(cmd_and_args) => {
-                output.push(Output {
-                    from_to: FromTo::LinkManagement(us),
-                    tags: (),
-                    cmd_and_args,
-                    then_close: false,
-                });
-                continue;
-            }
-        };
-
-        match message.command() {
-            Ok(Command::Ping(symbol)) => {
-                output.push(Output {
-                    from_to: FromTo::LinkManagement(us),
-                    tags: (),
-                    cmd_and_args: OutCommand::new("PONG", &[symbol]),
-                    then_close: false,
-                });
-                continue;
-            }
-            _ => (),
-        }
-
-        output.extend(work_client(
-            store,
-            users,
-            us,
-            clients.lazy_view_or_insert_with(us, || Client::PreAuth {
-                state: PreAuth::default(),
-                host: conn.reverse(),
-            }),
-            message,
-        ));
-    }
-
-    output
-}
-
 fn work_client(
     store: &mut Store,
     users: &mut Users,
-    us: mio::Token,
+    us: Uid,
     mut client: MapBorrow<ConnId, Client>,
     message: Message,
 ) -> Vec<Output> {
@@ -767,38 +693,6 @@ fn wrapped<'i, I: IntoIterator<Item = &'i str>>(it: I) -> Vec<String> {
     blocks
 }
 
-fn take_messages(conn: &mut serv::Conn) -> Vec<Result<Message, OutCommand>> {
-    if conn.input.broken {
-        match pop_line(&mut conn.input.buf) {
-            PoppedLine::Done(_) | PoppedLine::TooLong => {
-                conn.input.broken = false;
-            }
-            PoppedLine::NotReady => {
-                conn.input.buf.clear();
-                return Vec::new();
-            }
-        }
-    }
-
-    let mut output = Vec::with_capacity(4);
-    loop {
-        match line_to_message(conn.net.token, &mut conn.input.buf) {
-            Ok(Some(message)) => output.push(Ok(message)),
-            Ok(None) => break,
-            Err(response) => output.push(Err(response)),
-        }
-    }
-
-    if conn.input.buf.len() > 10 * INPUT_LENGTH_LIMIT {
-        output.push(Err(err::line_too_long((), "Your input buffer is full.")));
-
-        conn.input.broken = true;
-        conn.input.buf.clear();
-    }
-
-    output
-}
-
 fn send_on_boarding(nick: &str) -> Vec<OutCommand> {
     let mut output = Vec::with_capacity(16);
 
@@ -838,75 +732,55 @@ fn send_on_boarding(nick: &str) -> Vec<OutCommand> {
     output
 }
 
-fn line_to_message(
-    token: mio::Token,
-    input_buffer: &mut VecDeque<u8>,
-) -> Result<Option<Message>, OutCommand> {
-    let line = match pop_line(input_buffer) {
-        PoppedLine::Done(line) => line,
-        PoppedLine::NotReady => return Ok(None),
-        PoppedLine::TooLong => {
-            return Err(err::line_too_long(
-                (),
-                "Your message was discarded as it was too long",
-            ));
-        }
-    };
-
-    let line = String::from_utf8(line).map_err(|parse_error| {
-        debug!("{:?}: {:?}", token, parse_error);
-        err::bad_char_encoding(
-            (),
-            "*".to_string(),
-            "Your line was discarded as it was not encoded using 'utf-8'",
-        )
-    })?;
-
-    trace!("{:?}: line: {:?}", token, line);
-
+fn line_to_message(token: Uid, line: &str) -> Result<Option<Message>, OutCommand> {
     Ok(Some(proto::parse_message(line).map_err(|parse_error| {
         debug!("{:?}: bad command: {:?}", token, parse_error);
         err::unknown_error((), "*", "Unable to parse your input as any form of message")
     })?))
 }
 
-enum PoppedLine {
-    Done(Vec<u8>),
-    NotReady,
-    TooLong,
-}
-
-fn pop_line(buf: &mut VecDeque<u8>) -> PoppedLine {
-    if let Some(pos) = buf.iter().position(|&b| b'\n' == b) {
-        let drain = buf.drain(..pos);
-
-        if pos > INPUT_LENGTH_LIMIT {
-            // drain is dropped here, removing the data
-            return PoppedLine::TooLong;
-        }
-        let mut vec: Vec<u8> = drain.collect();
-        assert_eq!(Some(b'\n'), buf.pop_front());
-        while vec.ends_with(&[b'\r']) {
-            vec.pop();
-        }
-        PoppedLine::Done(vec)
-    } else {
-        PoppedLine::NotReady
-    }
-}
-
-fn main() -> Result<(), Error> {
+#[tokio::main]
+async fn main() -> Result<()> {
     env_logger::Builder::new().parse_filters("trace").init();
 
     let mut system = System::new()?;
 
-    let mut context = serv::Context::new()?;
-    let tls_config = Arc::new(serv::make_default_tls_config()?);
+    let lined = TcpStream::connect((Ipv6Addr::LOCALHOST, 6766)).await?;
+    let (read, mut write) = lined.into_split();
+    let mut read = BufReader::new(read);
 
-    context.bind_plain("[::]:6667".parse()?)?;
-    context.bind_tls("[::]:6697".parse()?, tls_config)?;
+    let (from_lined_tx, mut from_lined_rx) = tokio::sync::mpsc::channel::<FromLined>(128);
+    let (to_lined_tx, mut to_lined_rx) = tokio::sync::mpsc::channel::<ToLined>(128);
 
-    loop {
-        context.drive(|tokens, connections| system.work(tokens, connections))?;
+    let mut js = JoinSet::new();
+
+    js.spawn(async move {
+        let mut buf = Vec::with_capacity(usize::from(u16::MAX));
+        loop {
+            let len = usize::from(read.read_u16_le().await?);
+            buf.resize(len, 0);
+            read.read_exact(&mut buf).await?;
+            from_lined_tx.send(decode(&buf)?).await?;
+        }
+
+        Ok::<(), anyhow::Error>(())
+    });
+
+    js.spawn(async move {
+        while let Some(obj) = to_lined_rx.recv().await {
+            let buf = encode(obj)?;
+            let len = u16::try_from(buf.len())?;
+            write.write_u16_le(len).await?;
+            write.write_all(&buf).await?;
+        }
+        Ok::<(), anyhow::Error>(())
+    });
+
+    js.spawn(async move { system.run(from_lined_rx, to_lined_tx).await });
+
+    while let Some(task) = js.join_next().await {
+        task??;
     }
+
+    Ok(())
 }

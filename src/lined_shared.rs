@@ -3,10 +3,38 @@ use bincode::config as bc;
 use bincode::de::{BorrowDecoder, Decoder};
 use bincode::enc::Encoder;
 use bincode::error::DecodeError;
+use std::net::SocketAddr;
 use uuid::Uuid;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub struct Uid(pub Uuid);
+
+#[derive(bincode::Encode, bincode::Decode, Debug)]
+pub enum FromLined {
+    Message(Uid, MessageIn),
+}
+
+#[derive(bincode::Encode, bincode::Decode, Debug)]
+pub enum MessageIn {
+    Data(String),
+    Connected(SocketAddr),
+    Overflow,
+    InvalidUtf8,
+    Closed,
+}
+
+#[derive(bincode::Encode, bincode::Decode, Debug)]
+pub enum ToLined {
+    Message(Uid, MessageOut),
+}
+
+#[derive(bincode::Encode, bincode::Decode, Debug)]
+pub enum MessageOut {
+    Data(String),
+    FlushAndClose,
+    // not implemented
+    Terminate,
+}
 
 impl bincode::Encode for Uid {
     fn encode<E: Encoder>(

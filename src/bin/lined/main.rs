@@ -12,7 +12,7 @@ use crate::admin::run_admin;
 use crate::tempura::{add_keepalives, load_certs, load_keys};
 use crate::worker::run_worker;
 use anyhow::{anyhow, bail, Context, Result};
-use badchat::Uid;
+use badchat::{MessageIn, MessageOut, Uid};
 use bunyarrs::{vars, Bunyarr};
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
@@ -26,26 +26,6 @@ use tokio_util::sync::CancellationToken;
 struct Options {
     cert: PathBuf,
     key: PathBuf,
-}
-
-#[derive(bincode::Encode, bincode::Decode, Debug)]
-enum MessageIn {
-    Data(String),
-    Connected(SocketAddr),
-    Overflow,
-    InvalidUtf8,
-    Closed,
-}
-
-#[derive(bincode::Encode, bincode::Decode, Debug)]
-enum Command {
-    Message(Uid, MessageOut),
-}
-
-#[derive(bincode::Encode, bincode::Decode, Debug)]
-enum MessageOut {
-    Data(String),
-    Close,
 }
 
 struct State {
