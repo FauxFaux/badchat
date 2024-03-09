@@ -726,8 +726,7 @@ fn line_to_message(token: Uid, line: &str) -> Result<Option<Message>, OutCommand
     })?))
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+pub async fn main() -> Result<()> {
     env_logger::Builder::new().parse_filters("trace").init();
 
     let mut system = System::new()?;

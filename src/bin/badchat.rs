@@ -5,7 +5,8 @@ use std::env;
 async fn main() -> Result<()> {
     match env::args().nth(1).as_deref() {
         Some("lined") => return badchat::lined::main().await,
+        Some("bad") => return badchat::bad::main().await,
         _ => (),
     }
-    Err(anyhow!("usage: badchat lined"))
+    Err(anyhow!("usage: badchat lined|bad"))
 }
