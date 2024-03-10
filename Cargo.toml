@@ -12,6 +12,7 @@ config = "0.14"
 dns-lookup = "2"
 env_logger = "0.11"
 futures = "0.3"
+hickory-resolver = "0.24"
 log = "0.4.6"
 maplit = "1"
 pbkdf2 = { version = "0.12", features = ["simple"] }

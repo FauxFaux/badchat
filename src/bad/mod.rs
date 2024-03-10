@@ -3,23 +3,29 @@ mod ids;
 mod pre;
 mod proto;
 mod store;
+mod two;
 
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::future::Future;
 use std::mem;
 use std::net::Ipv6Addr;
 
 use anyhow::Result;
 use futures::StreamExt;
+use hickory_resolver::error::ResolveError;
+use hickory_resolver::lookup::ReverseLookup;
+use hickory_resolver::TokioAsyncResolver;
 use rand::Rng;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc::{Receiver, Sender};
-use tokio::task::JoinSet;
+use tokio::task::{JoinHandle, JoinSet};
 
 use super::lined::{read_message, write_message, FromLined, MessageIn, MessageOut, ToLined, Uid};
 
 use super::in_map::MapBorrow;
+use crate::bad::two::drive;
 use ids::ChannelName;
 use ids::HostMask;
 use ids::Nick;
@@ -51,6 +57,8 @@ struct System {
     store: Store,
     clients: Clients,
     users: Users,
+
+    resolver: TokioAsyncResolver,
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -183,6 +191,7 @@ fn s2u<S: ToString, I: IntoIterator<Item = S>>(to: UserId, cmd: &'static str, ar
 
 impl System {
     fn new() -> Result<System> {
+        let resolver = hickory_resolver::TokioAsyncResolver::tokio_from_system_conf()?;
         Ok(System {
             store: store::Store::new()?,
             clients: HashMap::new(),
@@ -190,6 +199,8 @@ impl System {
                 data: HashMap::new(),
                 next: 0,
             },
+
+            resolver,
         })
     }
 
@@ -757,7 +768,7 @@ pub async fn main() -> Result<()> {
         Ok::<(), anyhow::Error>(())
     });
 
-    js.spawn(async move { system.run(from_lined_rx, to_lined_tx).await });
+    js.spawn(async move { drive(from_lined_rx, to_lined_tx).await });
 
     while let Some(task) = js.join_next().await {
         task??;
