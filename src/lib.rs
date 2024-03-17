@@ -7,4 +7,3 @@ pub mod bad;
 mod in_map;
 pub mod lined;
 mod pbkdf2;
-mod rhost;

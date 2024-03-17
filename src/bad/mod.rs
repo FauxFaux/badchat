@@ -11,15 +11,12 @@ use std::mem;
 use std::net::Ipv6Addr;
 
 use anyhow::Result;
-use futures::StreamExt;
-use hickory_resolver::error::ResolveError;
-use hickory_resolver::lookup::ReverseLookup;
 use hickory_resolver::TokioAsyncResolver;
-use rand::{random, Rng};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use rand::random;
+use tokio::io::BufReader;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc::{Receiver, Sender};
-use tokio::task::{JoinHandle, JoinSet};
+use tokio::task::JoinSet;
 
 use super::lined::{read_message, write_message, FromLined, MessageIn, MessageOut, ToLined, Uid};
 
@@ -112,7 +109,7 @@ pub struct UserId(u64);
 enum Client {
     PreAuth {
         state: PreAuth,
-        host: super::rhost::ResolutionPending,
+        host: (),
     },
     Singleton {
         account_id: AccountId,
@@ -299,8 +296,8 @@ fn work_client(
     );
 
     match client.as_mut() {
-        Client::PreAuth { state, host } => match pre::work_pre_auth(&message, state) {
-            PreAuthOp::Done if host.done() => {
+        Client::PreAuth { state, .. } => match pre::work_pre_auth(&message, state) {
+            PreAuthOp::Done => {
                 let nick = state.nick.as_ref().unwrap().clone();
 
                 let account_id = AccountId(match store.account(state.pass.as_ref().unwrap()) {
@@ -348,7 +345,7 @@ fn work_client(
                 let user_id = UserId(users.next);
                 users.next += 1;
 
-                let (state, host) = match mem::replace(
+                let (state, _) = match mem::replace(
                     client.as_mut(),
                     Client::Singleton {
                         account_id,
@@ -360,7 +357,7 @@ fn work_client(
                 };
 
                 let (ident_name, _real_name) = state.gecos.unwrap();
-                let host = host.get();
+                let host = "";
 
                 let on_boarding = send_on_boarding(&nick.to_string());
 

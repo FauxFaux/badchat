@@ -16,11 +16,9 @@ use bunyarrs::{vars, vars_dbg, Bunyarr};
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 use tempura::{add_keepalives, load_certs, load_keys};
-use tokio::io::AsyncWriteExt;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 use tokio::select;
 use tokio::signal::unix::SignalKind;
-use tokio::task::JoinSet;
 use tokio::time::timeout;
 use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
@@ -34,7 +32,7 @@ struct Options {
     key: PathBuf,
 }
 
-struct State {
+pub struct State {
     inbound_tx: tokio::sync::mpsc::Sender<(Uid, MessageIn)>,
     inbound_rx: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<(Uid, MessageIn)>>,
     clients: Mutex<HashMap<Uid, Client>>,
@@ -289,6 +287,10 @@ async fn admin_server(
 
 #[tokio::test]
 async fn test_plain_chat() -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpStream;
+    use tokio::task::JoinSet;
+
     let state = make_state(Bunyarr::with_name("test"));
     let cancel = CancellationToken::new();
     let (p_port_s, p_port_r) = tokio::sync::oneshot::channel();
