@@ -7,7 +7,6 @@ mod two;
 
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::future::Future;
 use std::mem;
 use std::net::Ipv6Addr;
 
@@ -16,7 +15,7 @@ use futures::StreamExt;
 use hickory_resolver::error::ResolveError;
 use hickory_resolver::lookup::ReverseLookup;
 use hickory_resolver::TokioAsyncResolver;
-use rand::Rng;
+use rand::{random, Rng};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -42,7 +41,7 @@ pub struct PingToken(u64);
 
 impl Default for PingToken {
     fn default() -> Self {
-        PingToken(::rand::thread_rng().gen())
+        PingToken(random())
     }
 }
 
@@ -654,7 +653,7 @@ fn unpack_command(command: Result<Command, &'static str>) -> Result<Vec<Req>, Ou
             info!("invalid command: {:?}", other);
             Err(err::unknown_command(
                 (),
-                "*".to_string(),
+                "*",
                 "unrecognised or mis-parsed command",
             ))
         }

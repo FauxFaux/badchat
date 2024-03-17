@@ -41,7 +41,7 @@ pub fn line_too_long<I: Ident>(ident: I, reason: &'static str) -> OutCommand {
 }
 
 /// horse, but we also send it for some parse errors
-pub fn unknown_command<I: Ident>(ident: I, _cmd: String, reason: &'static str) -> OutCommand {
+pub fn unknown_command<I: Ident>(ident: I, _cmd: &str, reason: &'static str) -> OutCommand {
     // <client> <command> :Unknown command
     OutCommand::new("421", &[ident.as_ref(), "*", reason])
 }
@@ -77,7 +77,7 @@ pub fn password_mismatch<I: Ident>(ident: I, reason: &'static str) -> OutCommand
 }
 
 /// KineIRCd. Most IRCds pass-through. I don't agree.
-pub fn bad_char_encoding<I: Ident>(ident: I, _cmd: String, reason: &'static str) -> OutCommand {
+pub fn bad_char_encoding<I: Ident>(ident: I, _cmd: &str, reason: &'static str) -> OutCommand {
     // <client> <command> <charset> :<info>
     OutCommand::new("980", &[ident.as_ref(), "*", "utf-8", reason])
 }
