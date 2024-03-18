@@ -70,6 +70,7 @@ async fn work_client(
         nick: Option<String>,
         gecos: Option<(String, String)>,
         host: Option<String>,
+        ping_success: bool,
     }
     let mut pre = Pre::default();
 
@@ -78,6 +79,9 @@ async fn work_client(
 
     let deadline = Instant::now() + Duration::from_secs(5);
     let deadline = sleep(deadline - Instant::now());
+
+    let mut initial_ping_sent = false;
+    let initial_symbol = PingToken::default();
 
     while let Some(command) = regular_message(&mut inp, uid, &mut out).await {
         match command.command().expect("handled in 'regular_message'") {
@@ -88,6 +92,10 @@ async fn work_client(
             Command::User(a, _b, c) => {
                 pre.gecos = Some((a.to_string(), c.to_string()));
             }
+            // maybe we should handle pong with an invalid argument
+            Command::Pong(token) if u64::from_str_radix(token, 16) == Ok(initial_symbol.0) => {
+                pre.ping_success = true;
+            }
             // TODO: CAP LS, CAP END, PASS
             _ => {
                 send_out(
@@ -97,58 +105,34 @@ async fn work_client(
                 )
                 .await
                 .ok_or_else(|| anyhow!("gone away"))?;
+                continue;
             }
         }
-    }
-    let symbol = PingToken::default();
-    send_out(
-        &mut out,
-        uid,
-        OutCommand::new("PING", &[format!("{:08x}", symbol.0)]),
-    )
-    .await
-    .ok_or_else(|| anyhow!("gone away"))?;
 
-    // nah, we want to merge these; send the PING as soon as we've had any valid command from the client?
-    while let Some(command) = crate::bad::two::regular_message(&mut inp, uid, &mut out).await {
-        match command.command().expect("handled in 'regular_message'") {
-            Command::Pong(token) if u64::from_str_radix(token, 16) == Ok(symbol.0) => {
-                break;
-            }
-            Command::Pong(_) => {
-                send_out(
-                    &mut out,
-                    uid,
-                    err::unknown_command((), "", "unexpected PONG during pre-auth"),
-                )
-                .await
-                .ok_or_else(|| anyhow!("gone away"))?;
-            }
-            _ => {
-                send_out(
-                    &mut out,
-                    uid,
-                    err::unknown_command((), "", "unexpected command during middle pre-auth"),
-                )
-                .await
-                .ok_or_else(|| anyhow!("gone away"))?;
-            }
+        // fall through to here on any valid command
+        if !initial_ping_sent {
+            initial_ping_sent = true;
+            send_out(
+                &mut out,
+                uid,
+                OutCommand::new("PING", &[format!("{:08x}", initial_symbol.0)]),
+            )
+            .await
+            .ok_or_else(|| anyhow!("gone away"))?;
+        }
+
+        if pre.nick.is_some() && pre.gecos.is_some() && pre.ping_success {
+            break;
         }
     }
 
-    // res = &mut resolve => {
-    //     pre.host = Some(match res? {
-    //         Ok(name) => match name.iter().next() {
-    //             Some(name) => name.0.to_utf8(),
-    //             None => host.ip().to_string(),
-    //         },
-    //         Err(_) => host.ip().to_string(),
-    //     });
-    // }
-    // TODO: work out how to pin a sleep
-    // _ = &mut deadline => break,
-
-    unimplemented!();
+    pre.host = Some(match resolve.await? {
+        Ok(name) => match name.iter().next() {
+            Some(name) => name.0.to_utf8(),
+            None => host.ip().to_string(),
+        },
+        Err(_) => host.ip().to_string(),
+    });
 
     while let Some(msg) = inp.recv().await {
         println!("client {:?} got {:?}", uid, msg);
