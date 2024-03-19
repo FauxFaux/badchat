@@ -69,6 +69,7 @@ async fn work_client(
     struct Pre {
         nick: Option<String>,
         gecos: Option<(String, String)>,
+        pass: Option<String>,
         host: Option<String>,
         ping_success: bool,
     }
@@ -91,6 +92,9 @@ async fn work_client(
             }
             Command::User(a, _b, c) => {
                 pre.gecos = Some((a.to_string(), c.to_string()));
+            }
+            Command::Pass(pass) => {
+                pre.pass = Some(pass.to_string());
             }
             // maybe we should handle pong with an invalid argument
             Command::Pong(token) if u64::from_str_radix(token, 16) == Ok(initial_symbol.0) => {

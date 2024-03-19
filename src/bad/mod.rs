@@ -699,7 +699,7 @@ fn send_on_boarding(nick: &str) -> Vec<OutCommand> {
     output.push(OutCommand::new("004", &[nick, "ircd badchat iZ s"]));
     output.push(OutCommand::new(
         "005",
-        &[nick, "SAFELIST", "are supported by this server"],
+        &[nick, "SAFELIST", "UTF8ONLY", "are supported by this server"],
     ));
 
     // Minimal LUSERS
